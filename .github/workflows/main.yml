@@ -12,26 +12,39 @@ jobs:
     steps:
       - name: Recuperer les fichiers
         uses: actions/checkout@v4
+
       - name: Installer Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-      - name: Installer Gradle
+
+      - name: Installer Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Preparer Android SDK
+
+      - name: Installer Android SDK officiel
+        shell: bash
         run: |
-          SDKM=/usr/local/lib/android/sdk/cmdline-tools/16.0/bin/sdkmanager
-          test -x "$SDKM"
-          yes | "$SDKM" --licenses || true
-          "$SDKM" --install "platforms;android-35" "build-tools;35.0.0"
+          set -e
+          SDK="$RUNNER_TEMP/android-sdk"
+          mkdir -p "$SDK/cmdline-tools"
+          curl -fsSL --retry 3 "https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip" -o "$RUNNER_TEMP/android-tools.zip"
+          unzip -q "$RUNNER_TEMP/android-tools.zip" -d "$SDK/cmdline-tools"
+          mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" --licenses > /dev/null || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" "platforms;android-35" "build-tools;35.0.0"
+
       - name: Decompresser le projet
         run: unzip -q ChessFleches_v2_Projet_GitHub.zip
+
       - name: Compiler APK
         working-directory: ChessFleches
         run: gradle :app:assembleDebug --no-daemon
+
       - name: Recuperer APK
         uses: actions/upload-artifact@v4
         with:
