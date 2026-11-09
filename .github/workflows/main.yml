@@ -1,4 +1,4 @@
-name: Compiler Chess Fleches V2
+name: Compiler Chess Fleches V3
 on:
   push:
     branches: [main]
@@ -41,6 +41,116 @@ jobs:
       - name: Decompresser le projet
         run: unzip -q ChessFleches_v2_Projet_GitHub.zip
 
+      - name: Corriger le cadre vert et les fleches
+        shell: bash
+        run: |
+          python3 - <<'PYFIX'
+          #!/usr/bin/env python3
+          """Chess Fleches: fix board validation, overlay offset and stale arrows."""
+          from pathlib import Path
+
+          src = Path('ChessFleches/app/src/main/java/fr/chessfleches')
+
+          def read(name):
+              return (src / name).read_text(encoding='utf-8')
+
+          def write(name, data):
+              (src / name).write_text(data, encoding='utf-8')
+
+          def once(data, old, new, name):
+              if data.count(old) != 1:
+                  raise RuntimeError('Expected one patch anchor in '+name+': '+repr(old[:80]))
+              return data.replace(old, new, 1)
+
+          v = read('BoardVision.java')
+          start = v.index('  private Box fullWidth(Bitmap image){')
+          end = v.index('  public Box detectOnScreen(Bitmap image){', start)
+          v = v[:start] + '''
+            private static double boardColorDistance(int color,double[] bg){
+              double r=channel(color,16)-bg[0],g=channel(color,8)-bg[1],b=channel(color,0)-bg[2];
+              return Math.sqrt((r*r+g*g+b*b)/3.0);
+            }
+            /** Only accept a correctly aligned 8x8 checkerboard. */
+            private static int matchingSquares(Bitmap image,int y,int size){
+              int matches=0;
+              double sq=size/8.0;
+              double[][] corners={{.16,.18},{.84,.18},{.16,.82},{.84,.82}};
+              for(int r=0;r<8;r++)for(int c=0;c<8;c++){
+                int close=0;
+                double[] bg=BG[(r+c)&1];
+                for(double[] pt:corners){
+                  int x=(int)Math.round((c+pt[0])*sq);
+                  int yy=(int)Math.round(y+(r+pt[1])*sq);
+                  if(boardColorDistance(pixel(image,x,yy),bg)<44)close++;
+                }
+                if(close>=3)matches++;
+              }
+              return matches;
+            }
+            private Box fullWidth(Bitmap image){
+              int w=image.getWidth(),h=image.getHeight();
+              if(w<280||h<w+8)return null;
+              int size=w,hi=h-size;
+              double best=-1;int bestY=-1;
+              int[] xs=new int[8];
+              for(int c=0;c<8;c++)xs[c]=(int)((c+.14)*size/8);
+              for(int y=0;y<=hi;y+=2){
+                if(matchingSquares(image,y,size)<52)continue;
+                double score=0;
+                for(int r=0;r<=8;r++){
+                  int yy=y+(int)(r*size/8.0);
+                  for(int c=0;c<8;c++)
+                    score+=diff(pixel(image,xs[c],yy-2),pixel(image,xs[c],yy+2));
+                }
+                if(score>best){best=score;bestY=y;}
+              }
+              return best>1300?new Box(0,bestY,size):null;
+            }
+          ''' + v[end:]
+          v = once(v, '  public Box board(){return board;}',
+                   '  public Box board(){return board;}\n  public void align(Box visible){if(visible!=null)board=visible;}',
+                   'BoardVision.java')
+          v = once(v, '    Box value=fullWidth(small);\n    if(small!=image)small.recycle();',
+                   '    Box value=fullWidth(small);\n    int smallHeight=small.getHeight();\n    if(small!=image)small.recycle();',
+                   'BoardVision.java')
+          v = once(v, '    return new Box(0,(int)Math.round(value.y*(h/(double)(h/scale))),w);',
+                   '    return new Box(0,(int)Math.round(value.y*(h/(double)smallHeight)),w);',
+                   'BoardVision.java')
+          write('BoardVision.java', v)
+
+          c = read('CaptureService.java')
+          c = once(c, '  private void process(Bitmap image){\n    if(!vision.calibrated()){', '''  private void process(Bitmap image){
+              BoardVision.Box visible=vision.detectOnScreen(image);
+              if(visible==null){
+                vision.reset();game=null;scanPending="";scanSame=0;
+                pending="";same=0;analyzed="";arrows.clear();
+                overlay.show(null,new ArrayList<>(),white);
+                overlay.status("Aucun echiquier detecte");
+                return;
+              }
+              if(!vision.calibrated()){''', 'CaptureService.java')
+          c = once(c, '      BoardVision.Box rect=vision.detectOnScreen(image);',
+                   '      BoardVision.Box rect=visible;', 'CaptureService.java')
+          c = once(c, '    }else{\n      Chess.Move next=vision.detectMove(image,game,white);',
+                   '    }else{\n      vision.align(visible);\n      Chess.Move next=vision.detectMove(image,game,white);',
+                   'CaptureService.java')
+          write('CaptureService.java', c)
+
+          o = read('OverlayUI.java')
+          o = once(o, '      int n=Math.min(5,suggestions.size());float sz=board.size/8f;', '''      int[] screenOrigin=new int[2];
+                getLocationOnScreen(screenOrigin);
+                float left=board.x-screenOrigin[0],top=board.y-screenOrigin[1];
+                int n=Math.min(5,suggestions.size());float sz=board.size/8f;''', 'OverlayUI.java')
+          o = once(o, '        float x=board.x+(fromC+.5f)*sz,y=board.y+(fromR+.5f)*sz;',
+                   '        float x=left+(fromC+.5f)*sz,y=top+(fromR+.5f)*sz;', 'OverlayUI.java')
+          o = once(o, '        float tx=board.x+(toC+.5f)*sz,ty=board.y+(toR+.5f)*sz;',
+                   '        float tx=left+(toC+.5f)*sz,ty=top+(toR+.5f)*sz;', 'OverlayUI.java')
+          o = once(o, '      canvas.drawRect(new RectF(board.x,board.y,board.x+board.size,board.y+board.size),p);',
+                   '      canvas.drawRect(new RectF(left,top,left+board.size,top+board.size),p);', 'OverlayUI.java')
+          write('OverlayUI.java', o)
+          print('Correctif applique')
+          PYFIX
+
       - name: Compiler APK
         working-directory: ChessFleches
         run: gradle :app:assembleDebug --no-daemon
@@ -48,6 +158,6 @@ jobs:
       - name: Recuperer APK
         uses: actions/upload-artifact@v4
         with:
-          name: ChessFleches-V2-APK
+          name: ChessFleches-V3-APK
           path: ChessFleches/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
