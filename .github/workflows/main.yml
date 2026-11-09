@@ -23,8 +23,10 @@ jobs:
           gradle-version: '8.9'
       - name: Preparer Android SDK
         run: |
-          yes | sdkmanager --licenses || true
-          sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
+          SDKM=/usr/local/lib/android/sdk/cmdline-tools/16.0/bin/sdkmanager
+          test -x "$SDKM"
+          yes | "$SDKM" --licenses || true
+          "$SDKM" --install "platforms;android-35" "build-tools;35.0.0"
       - name: Decompresser le projet
         run: unzip -q ChessFleches_v2_Projet_GitHub.zip
       - name: Compiler APK
