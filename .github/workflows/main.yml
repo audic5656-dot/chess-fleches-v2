@@ -160,7 +160,7 @@ jobs:
           src=Path('ChessFleches/app/src/main/java/fr/chessfleches')
           p=src/'BoardVision.java'
           v=p.read_text(encoding='utf-8')
-          start=v.index('  /** Reconstruit les pieces depuis l\'image') if '  /** Reconstruit les pieces depuis l\'image' in v else v.index('  /** Reconstruit les pièces depuis l\'image')
+          start=v.index('  public Chess.Board scanPosition(')
           end=v.index('  /** Apprentissage de ce qui est reconnu',start)
           replacement='''  /** Locate the precise first row, correcting detector rounding. */
             private Box refineTop(Bitmap image,Box coarse){
