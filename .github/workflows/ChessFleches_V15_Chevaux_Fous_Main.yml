@@ -1,0 +1,1719 @@
+name: Compiler Chess Fleches V15 Chevaux Fous + Reine + Piegeur
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  construire-apk:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Recuperer les fichiers
+        uses: actions/checkout@v4
+
+      - name: Installer Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Installer Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Installer Android SDK officiel
+        shell: bash
+        run: |
+          set -e
+          SDK="$RUNNER_TEMP/android-sdk"
+          mkdir -p "$SDK/cmdline-tools"
+          curl -fsSL --retry 3 "https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip" -o "$RUNNER_TEMP/android-tools.zip"
+          unzip -q "$RUNNER_TEMP/android-tools.zip" -d "$SDK/cmdline-tools"
+          mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" --licenses > /dev/null || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Decompresser le projet
+        run: unzip -q ChessFleches_v2_Projet_GitHub.zip
+
+      - name: Corriger le cadre vert et les fleches
+        shell: bash
+        run: |
+          python3 - <<'PYFIX'
+          #!/usr/bin/env python3
+          """Chess Flèches: fix chessboard validation, overlay offset and stale arrows."""
+          from pathlib import Path
+          
+          src = Path('ChessFleches/app/src/main/java/fr/chessfleches')
+          
+          def read(name):
+              return (src / name).read_text(encoding='utf-8')
+          
+          def write(name, data):
+              (src / name).write_text(data, encoding='utf-8')
+          
+          def once(data, old, new, name):
+              if data.count(old) != 1:
+                  raise RuntimeError('Expected one patch anchor in '+name+': '+repr(old[:80]))
+              return data.replace(old, new, 1)
+          
+          v = read('BoardVision.java')
+          start = v.index('  private Box fullWidth(Bitmap image){')
+          end = v.index('  public Box detectOnScreen(Bitmap image){', start)
+          v = v[:start] + '''
+            private static double boardColorDistance(int color,double[] bg){
+              double r=channel(color,16)-bg[0],g=channel(color,8)-bg[1],b=channel(color,0)-bg[2];
+              return Math.sqrt((r*r+g*g+b*b)/3.0);
+            }
+            /** Only accept a real, correctly aligned 8x8 Chess Universe checkerboard. */
+            private static int matchingSquares(Bitmap image,int y,int size){
+              int matches=0;
+              double sq=size/8.0;
+              double[][] corners={{.16,.18},{.84,.18},{.16,.82},{.84,.82}};
+              for(int r=0;r<8;r++)for(int c=0;c<8;c++){
+                int close=0;
+                double[] bg=BG[(r+c)&1];
+                for(double[] pt:corners){
+                  int x=(int)Math.round((c+pt[0])*sq);
+                  int yy=(int)Math.round(y+(r+pt[1])*sq);
+                  if(boardColorDistance(pixel(image,x,yy),bg)<44)close++;
+                }
+                if(close>=3)matches++;
+              }
+              return matches;
+            }
+            private Box fullWidth(Bitmap image){
+              int w=image.getWidth(),h=image.getHeight();
+              if(w<280||h<w+8)return null;
+              int size=w,hi=h-size;
+              double best=-1;int bestY=-1;
+              int[] xs=new int[8];
+              for(int c=0;c<8;c++)xs[c]=(int)((c+.14)*size/8);
+              for(int y=0;y<=hi;y+=2){
+                if(matchingSquares(image,y,size)<52)continue;
+                double score=0;
+                for(int r=0;r<=8;r++){
+                  int yy=y+(int)(r*size/8.0);
+                  for(int c=0;c<8;c++)
+                    score+=diff(pixel(image,xs[c],yy-2),pixel(image,xs[c],yy+2));
+                }
+                if(score>best){best=score;bestY=y;}
+              }
+              return best>1300?new Box(0,bestY,size):null;
+            }
+          ''' + v[end:]
+          v = once(v, '  public Box board(){return board;}',
+                   '  public Box board(){return board;}\n  public void align(Box visible){if(visible!=null)board=visible;}',
+                   'BoardVision.java')
+          v = once(v, '    Box value=fullWidth(small);\n    if(small!=image)small.recycle();',
+                   '    Box value=fullWidth(small);\n    int smallHeight=small.getHeight();\n    if(small!=image)small.recycle();',
+                   'BoardVision.java')
+          v = once(v, '    return new Box(0,(int)Math.round(value.y*(h/(double)(h/scale))),w);',
+                   '    return new Box(0,(int)Math.round(value.y*(h/(double)smallHeight)),w);',
+                   'BoardVision.java')
+          write('BoardVision.java', v)
+          
+          c = read('CaptureService.java')
+          c = once(c, '  private void process(Bitmap image){\n    if(!vision.calibrated()){', '''  private void process(Bitmap image){
+              BoardVision.Box visible=vision.detectOnScreen(image);
+              if(visible==null){
+                vision.reset();game=null;scanPending="";scanSame=0;
+                pending="";same=0;analyzed="";arrows.clear();
+                overlay.show(null,new ArrayList<>(),white);
+                overlay.status("Aucun echiquier detecte");
+                return;
+              }
+              if(!vision.calibrated()){''', 'CaptureService.java')
+          c = once(c, '      BoardVision.Box rect=vision.detectOnScreen(image);',
+                   '      BoardVision.Box rect=visible;', 'CaptureService.java')
+          c = once(c, '    }else{\n      Chess.Move next=vision.detectMove(image,game,white);',
+                   '    }else{\n      vision.align(visible);\n      Chess.Move next=vision.detectMove(image,game,white);',
+                   'CaptureService.java')
+          write('CaptureService.java', c)
+          
+          o = read('OverlayUI.java')
+          o = once(o, '      int n=Math.min(5,suggestions.size());float sz=board.size/8f;', '''      // Convert MediaProjection physical-screen pixels to overlay-view pixels.
+                int[] screenOrigin=new int[2];
+                getLocationOnScreen(screenOrigin);
+                float left=board.x-screenOrigin[0],top=board.y-screenOrigin[1];
+                int n=Math.min(5,suggestions.size());float sz=board.size/8f;''', 'OverlayUI.java')
+          o = once(o, '        float x=board.x+(fromC+.5f)*sz,y=board.y+(fromR+.5f)*sz;',
+                   '        float x=left+(fromC+.5f)*sz,y=top+(fromR+.5f)*sz;', 'OverlayUI.java')
+          o = once(o, '        float tx=board.x+(toC+.5f)*sz,ty=board.y+(toR+.5f)*sz;',
+                   '        float tx=left+(toC+.5f)*sz,ty=top+(toR+.5f)*sz;', 'OverlayUI.java')
+          o = once(o, '      canvas.drawRect(new RectF(board.x,board.y,board.x+board.size,board.y+board.size),p);',
+                   '      canvas.drawRect(new RectF(left,top,left+board.size,top+board.size),p);', 'OverlayUI.java')
+          write('OverlayUI.java', o)
+          print('Patch Chess Flèches appliqué avec succès')
+          PYFIX
+
+      - name: Aligner la reconnaissance et garder les coups legaux (V5)
+        shell: bash
+        run: |
+          python3 - <<'PYV5'
+          from pathlib import Path
+          src = Path('ChessFleches/app/src/main/java/fr/chessfleches')
+          p=src/'BoardVision.java'
+          s=p.read_text(encoding='utf-8')
+          start=s.index('  /** Réconstruit les pièces depuis l\'image')
+          end=s.index('  /** Apprentissage de ce qui est reconnu', start)
+          replacement='''  /** Test a precise board offset. Reject malformed positions instead of guessing. */
+            private static final class VisionCandidate {
+              final Box box;
+              final Chess.Board game;
+              final double loss;
+              VisionCandidate(Box rect,Chess.Board position,double value){box=rect;game=position;loss=value;}
+            }
+            private VisionCandidate classifyAt(Bitmap image,Box rect,boolean whiteBottom,boolean whiteToMove){
+              board=rect;
+              double[][] scores=readCosts(image);
+              Chess.Board found=new Chess.Board();found.whiteTurn=whiteToMove;
+              found.rights=0;found.ep=-1;
+              double total=0;
+              int unsure=0;
+              for(int r=0;r<8;r++)for(int c=0;c<8;c++){
+                double[] values=scores[r*8+c];
+                int best=0;double score=values[0],second=Double.POSITIVE_INFINITY;
+                for(int k=1;k<values.length;k++){
+                  if(values[k]<score){second=score;score=values[k];best=k;}
+                  else if(values[k]<second)second=values[k];
+                }
+                if(best>0&&score>2.70){best=0;unsure+=2;}
+                if(best>0&&second-score<.08)unsure++;
+                // Prefer sharp silhouette matches and the alignment with the least error.
+                total+=score;
+                found.b[internal(r,c,whiteBottom)]=TYPES[best];
+              }
+              if(unsure>9||!Chess.plausible(found))return null;
+              return new VisionCandidate(rect,found,total+2*unsure);
+            }
+            /** Refine an 8x8 frame by a few physical pixels, including odd offsets.
+             *  The V3 detector rounds to a scaled even row and can be two pixels off. */
+            public Chess.Board scanPosition(Bitmap image,Box rect,boolean whiteBottom,boolean whiteToMove){
+              if(rect==null)return null;
+              VisionCandidate best=null;
+              final int reach=Math.max(6,rect.size/150);
+              for(int dy=-reach;dy<=reach;dy++){
+                int yy=rect.y+dy;
+                if(yy<0||yy+rect.size>image.getHeight())continue;
+                VisionCandidate trial=classifyAt(image,new Box(rect.x,yy,rect.size),whiteBottom,whiteToMove);
+                if(trial!=null&&(best==null||trial.loss<best.loss))best=trial;
+              }
+              if(best==null){board=null;alignmentOffset=0;return null;}
+              board=best.box;
+              alignmentOffset=best.box.y-rect.y;
+              return best.game;
+            }
+          '''
+          s=s[:start]+replacement+s[end:]
+          old='  private Box board;'
+          assert s.count(old)==1,(old,s.count(old))
+          s=s.replace(old,old+'\n  private int alignmentOffset=0;',1)
+          old='  public void reset(){board=null;ready=false;'
+          assert s.count(old)==1,(old,s.count(old))
+          s=s.replace(old,'  public void reset(){board=null;alignmentOffset=0;ready=false;',1)
+          old='  public void align(Box visible){if(visible!=null)board=visible;}'
+          assert s.count(old)==1,(old,s.count(old))
+          s=s.replace(old,'  public void align(Box visible){if(visible!=null)board=new Box(visible.x,visible.y+alignmentOffset,visible.size);}',1)
+          old='    board=rect;ready=true;'
+          assert s.count(old)==1,(old,s.count(old))
+          s=s.replace(old,'    board=new Box(rect.x,rect.y+alignmentOffset,rect.size);ready=true;',1)
+          p.write_text(s,encoding='utf-8')
+          print('V5: scan alignment corrected, retains board offset and validates kings')
+          PYV5
+
+      - name: Synchronisation visuelle anti-coups-impossibles V6
+        shell: bash
+        run: |
+          python3 - <<'PYV6'
+          from pathlib import Path
+          root=Path('ChessFleches/app/src/main/java/fr/chessfleches')
+          
+          def once(data,old,new,where):
+              if data.count(old)!=1: raise ValueError(f'Expected 1 anchor {where}, got {data.count(old)}: {old[:80]!r}')
+              return data.replace(old,new,1)
+          
+          vfile=root/'BoardVision.java';s=vfile.read_text(encoding='utf-8')
+          new_methods='''  /** Independent silhouette test; ignores last-move square background colour. */
+            private boolean visiblyOccupied(Bitmap image,Box rect,int r,int c){
+              double sq=rect.size/8.0;
+              int[] red=new int[4],green=new int[4],blue=new int[4];
+              double[] pts={.07,.93};int k=0;
+              for(double vy:pts)for(double vx:pts){
+                int x=(int)Math.round(rect.x+(c+vx)*sq);
+                int y=(int)Math.round(rect.y+(r+vy)*sq);
+                int color=pixel(image,x,y);
+                red[k]=channel(color,16);green[k]=channel(color,8);blue[k]=channel(color,0);k++;
+              }
+              java.util.Arrays.sort(red);java.util.Arrays.sort(green);java.util.Arrays.sort(blue);
+              double bgR=(red[1]+red[2])/2.0,bgG=(green[1]+green[2])/2.0,bgB=(blue[1]+blue[2])/2.0;
+              int pixels=0;
+              final int n=12;
+              for(int yy=0;yy<n;yy++)for(int xx=0;xx<n;xx++){
+                double vx=.20+.60*(xx+.5)/n,vy=.20+.60*(yy+.5)/n;
+                int x=(int)Math.round(rect.x+(c+vx)*sq);
+                int y=(int)Math.round(rect.y+(r+vy)*sq);
+                int color=pixel(image,x,y);
+                double dr=channel(color,16)-bgR,dg=channel(color,8)-bgG,db=channel(color,0)-bgB;
+                if((dr*dr+dg*dg+db*db)/3.0>48.0*48.0)pixels++;
+              }
+              return pixels>=16;
+            }
+            /** Only trust the engine when the actual pixels agree with the saved board. */
+            public boolean positionMatches(Bitmap image,Chess.Board expected,boolean whiteBottom){
+              if(image==null||board==null||expected==null)return false;
+              double[][] scores=readCosts(image);
+              if(scores==null)return false;
+              for(int r=0;r<8;r++)for(int c=0;c<8;c++){
+                char predicted=expected.b[internal(r,c,whiteBottom)];
+                boolean occupied=visiblyOccupied(image,board,r,c);
+                if(occupied!=(predicted!='.'))return false;
+                if(occupied){
+                  double[] rowScores=scores[r*8+c];
+                  int target=typeIndex(predicted),best=1;
+                  for(int i=2;i<rowScores.length;i++)if(rowScores[i]<rowScores[best])best=i;
+                  // A clear different piece is evidence that the game state has drifted.
+                  if(best!=target&&rowScores[target]-rowScores[best]>1.3&&rowScores[best]<2.2)return false;
+                }
+              }
+              return true;
+            }
+          '''
+          s=once(s,'  /** Apprentissage de ce qui est reconnu',new_methods+'  /** Apprentissage de ce qui est reconnu','vision-methods')
+          s=once(s,'      if(best>0&&second-score<.08)unsure++;','      if(best>0&&second-score<.08)unsure++;\n                if((best!=0)!=visiblyOccupied(image,rect,r,c))return null;','vision-scan')
+          s=once(s,'learned[i].add(feature(image,rect,r,c));','learned[i].add(feature(image,board,r,c));','vision-learning')
+          vfile.write_text(s,encoding='utf-8')
+          
+          cfile=root/'CaptureService.java';c=cfile.read_text(encoding='utf-8')
+          c=once(c,'private int same=0,scanSame=0,frames=0;', 'private int same=0,scanSame=0,frames=0,lostFrames=0;','capture-decl')
+          c=once(c,'same=0;frames=0;analyzed="";', 'same=0;frames=0;lostFrames=0;analyzed="";','capture-reset')
+          needle='''      game=scanned;vision.calibrate(image,rect,game,white);
+                overlay.status("Position reconnue ✓ · "+(game.whiteTurn?"Blancs":"Noirs")+" au trait");'''
+          repl='''      game=scanned;vision.calibrate(image,rect,game,white);
+                if(!vision.positionMatches(image,game,white)){
+                  vision.reset();game=null;scanSame=0;analyzed="";arrows.clear();
+                  overlay.show(null,new ArrayList<>(),white);
+                  overlay.status("Pieces mal reconnues · nouvelle lecture");
+                  return;
+                }
+                lostFrames=0;
+                overlay.status("Position reconnue ✓ · "+(game.whiteTurn?"Blancs":"Noirs")+" au trait");'''
+          c=once(c,needle,repl,'capture-initial-check')
+          old='''    }else{
+                vision.align(visible);
+                Chess.Move next=vision.detectMove(image,game,white);
+                if(next==null){pending="";same=0;}
+                else if(Chess.uci(next).equals(pending)){
+                  if(++same>=2){game=Chess.move(game,next);same=0;pending="";analyzed="";}
+                }else{pending=Chess.uci(next);same=1;}
+              }
+          '''
+          new='''    }else{
+                vision.align(visible);
+                if(!vision.positionMatches(image,game,white)){
+                  // Never show a move for a stale or visually contradictory game state.
+                  arrows.clear();analyzed="";
+                  Chess.Move next=vision.detectMove(image,game,white);
+                  Chess.Board after=next==null?null:Chess.move(game,next);
+                  if(after!=null&&vision.positionMatches(image,after,white)){
+                    lostFrames=0;
+                    String uci=Chess.uci(next);
+                    if(uci.equals(pending))same++;else{pending=uci;same=1;}
+                    if(same>=2){game=after;pending="";same=0;}
+                    overlay.show(vision.board(),new ArrayList<>(),white);
+                    overlay.status("Verification du coup · analyse actualisee");
+                    return;
+                  }
+                  pending="";same=0;
+                  overlay.show(vision.board(),new ArrayList<>(),white);
+                  overlay.status("Position differente · resynchronisation");
+                  if(++lostFrames>=3)resetSession();
+                  return;
+                }
+                lostFrames=0;pending="";same=0;
+              }
+          '''
+          c=once(c,old,new,'capture-live-sync')
+          cfile.write_text(c,encoding='utf-8')
+          print('Applied V6 safety patch')
+          PYV6
+
+      - name: Limiter la latence et les sacrifices gratuits (V7)
+        shell: bash
+        run: |
+          python3 - <<'PYV7'
+          from pathlib import Path
+          root = Path('ChessFleches/app/src/main/java/fr/chessfleches')
+          
+          def once(data, old, new, label):
+              n=data.count(old)
+              if n!=1: raise ValueError(f'{label}: expected one anchor, got {n}')
+              return data.replace(old,new,1)
+          
+          # Shorten the engine budget. The previous 5/5 setting could spend 2.4s per search
+          # on the main capture loop, not counting image work.
+          cfile=root/'CaptureService.java'
+          c=cfile.read_text(encoding='utf-8')
+          c=once(c,'engine.analyze(game,styles,count,effort*480,effort)',
+                 'engine.analyze(game,styles,count,Math.min(600,Math.max(250,effort*150)),effort)',
+                 'analysis time limit')
+          cfile.write_text(c,encoding='utf-8')
+          
+          # Eliminate the "sacrifice for style" incentive. Only choose within a small,
+          # search-evaluated margin of the best move; mate scores still win.
+          p=root/'TacticalEngine.java';s=p.read_text(encoding='utf-8')
+          s=once(s,'(++nodes&255)==0','(++nodes&31)==0','time-check frequency')
+          s=once(s,'    int score=e.base;boolean check=Chess.inCheck(after,after.whiteTurn);', '''    // No chosen style can override a clearly worse tactical evaluation.
+              // This is NOT a proof of soundness, only a guard against style-only blunders.
+              if(e.base < best-35 && e.base < 28000)return -100000+e.base;
+              int score=e.base;boolean check=Chess.inCheck(after,after.whiteTurn);''','best-move safety')
+          start=s.index('      case FOU:\n')
+          end=s.index('      case DEFENSIF:\n',start)
+          s=s[:start]+'''      case FOU:
+                  // Prefer forcing attacks, never REWARD an unsupported sacrifice.
+                  score+=check?30:0;
+                  score+=Math.min(25,captured/40)+center*2+Math.min(14,threats*3);
+                  if(moverThreatened&&piece>=300&&captured<piece/2)score-=80;
+                  break;
+          '''+s[end:]
+          p.write_text(s,encoding='utf-8')
+          
+          # Image verification currently extracts 64 classification vectors on EVERY frame.
+          # Use a lightweight silhouette/occupancy match for known tracked positions,
+          # and reserve full piece classification for initial scan/re-synchronisation.
+          p=root/'BoardVision.java';s=p.read_text(encoding='utf-8')
+          start=s.index('  /** Only trust the engine when the actual pixels agree with the saved board. */')
+          end=s.index('  /** Apprentissage de ce qui est reconnu',start)
+          s=s[:start]+'''  /** Fast verification: stop rather than displaying arrows for moved/missing pieces. */
+            public boolean positionMatches(Bitmap image,Chess.Board expected,boolean whiteBottom){
+              if(image==null||board==null||expected==null||image.getWidth()!=board.size)return false;
+              for(int r=0;r<8;r++)for(int c=0;c<8;c++){
+                boolean expectedOccupied=expected.b[internal(r,c,whiteBottom)]!='.';
+                if(visiblyOccupied(image,board,r,c)!=expectedOccupied)return false;
+              }
+              return true;
+            }
+          '''+s[end:]
+          # Fast path to avoid the expensive full-height repeated scan on stable frames.
+          s=once(s,'  public Box detectOnScreen(Bitmap image){','''  public Box detectOnScreen(Bitmap image){
+              if(ready && board!=null && image!=null && board.size==image.getWidth()){
+                int y=board.y-alignmentOffset;
+                if(y>=0 && y+board.size<=image.getHeight() &&
+                   matchingSquares(image,y,board.size)>=52)
+                   return new Box(0,y,board.size);
+              }''','fast board location')
+          p.write_text(s,encoding='utf-8')
+          print('V7 speed/playing-style guard applied')
+          PYV7
+
+      - name: Installer Stockfish 19 ARM64 officiel
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 3 \
+            "https://github.com/official-stockfish/Stockfish/releases/download/sf_19/stockfish-android-arm64-universal.tar.gz" \
+            -o "$RUNNER_TEMP/stockfish19.tar.gz"
+          mkdir -p "$RUNNER_TEMP/stockfish19" ChessFleches/app/src/main/jniLibs/arm64-v8a ChessFleches/app/src/main/assets
+          tar xzf "$RUNNER_TEMP/stockfish19.tar.gz" -C "$RUNNER_TEMP/stockfish19"
+          ENGINE=""
+          while IFS= read -r -d '' candidate; do
+            if file "$candidate" | grep -Eq 'ELF.*(aarch64|ARM aarch64)'; then
+              ENGINE="$candidate"
+              break
+            fi
+          done < <(find "$RUNNER_TEMP/stockfish19" -type f -print0)
+          if [ -z "$ENGINE" ]; then
+            echo 'Stockfish 19 ARM64 executable not found in official archive'; exit 1
+          fi
+          cp "$ENGINE" ChessFleches/app/src/main/jniLibs/arm64-v8a/libstockfish.so
+          chmod 755 ChessFleches/app/src/main/jniLibs/arm64-v8a/libstockfish.so
+          curl -fLsS https://raw.githubusercontent.com/official-stockfish/Stockfish/sf_19/Copying.txt -o ChessFleches/app/src/main/assets/stockfish_GPLv3.txt || \
+            curl -fLsS https://raw.githubusercontent.com/official-stockfish/Stockfish/sf_19/COPYING -o ChessFleches/app/src/main/assets/stockfish_GPLv3.txt
+          printf 'Stockfish 19 is GNU GPLv3 software. Exact official source: https://github.com/official-stockfish/Stockfish/tree/sf_19\n' > ChessFleches/app/src/main/assets/stockfish_source.txt
+          file ChessFleches/app/src/main/jniLibs/arm64-v8a/libstockfish.so
+
+      - name: Installer Patricia 5.1 ARM64 (optionnel)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/patricia51" ChessFleches/app/src/main/jniLibs/arm64-v8a
+          # SourceForge portable Android ARM64 package; Stockfish remains the fallback.
+          if ! curl -fL --retry 2 --connect-timeout 15 --max-time 120 \
+            "https://downloads.sourceforge.net/project/chess-engines-for-android/Patricia_5.1.zip" \
+            -o "$RUNNER_TEMP/patricia51.zip"; then
+            echo 'Patricia 5.1 download unavailable: continuing with Stockfish 19'
+            exit 0
+          fi
+          if ! unzip -q "$RUNNER_TEMP/patricia51.zip" -d "$RUNNER_TEMP/patricia51"; then
+            echo 'Patricia 5.1 package unreadable: continuing with Stockfish 19'
+            exit 0
+          fi
+          PATRICIA=''
+          while IFS= read -r -d '' candidate; do
+            if file "$candidate" | grep -Eq 'ELF.*(aarch64|ARM aarch64)'; then
+              case "$(printf %s "$candidate" | tr '[:upper:]' '[:lower:]')" in
+                *arm64-v8a*|*arm64*) PATRICIA="$candidate"; break ;;
+              esac
+            fi
+          done < <(find "$RUNNER_TEMP/patricia51" -type f -print0)
+          if [ -n "$PATRICIA" ]; then
+            cp "$PATRICIA" ChessFleches/app/src/main/jniLibs/arm64-v8a/libpatricia.so
+            chmod 755 ChessFleches/app/src/main/jniLibs/arm64-v8a/libpatricia.so
+            echo 'Patricia 5.1 ARM64 binary packaged'
+          else
+            echo 'No suitable Patricia ARM64 executable, Stockfish 19 only'
+          fi
+
+      - name: Integrer le moteur et accelerer les fleches V8
+        shell: bash
+        run: |
+          cat > /tmp/StockfishEngine.java <<'JAVAENGINE'
+          package fr.chessfleches;
+          
+          import java.io.BufferedReader;
+          import java.io.BufferedWriter;
+          import java.io.InputStreamReader;
+          import java.io.OutputStreamWriter;
+          import java.nio.charset.StandardCharsets;
+          import java.io.File;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.List;
+          
+          /** Persistent, local UCI Stockfish engine. Never supplies a move absent from Chess.legal(). */
+          public final class StockfishEngine implements AutoCloseable {
+            private final String executable;
+            private Process process;
+            private BufferedReader reader;
+            private BufferedWriter writer;
+            private String lastError="";
+            private static final int THINK_MS=85;
+            public StockfishEngine(String path){executable=path;}
+            public synchronized String error(){return lastError;}
+            public synchronized boolean ready(){return process!=null&&process.isAlive();}
+          
+            private void command(String msg) throws Exception {
+              writer.write(msg);writer.write('\n');writer.flush();
+            }
+            private String readUntil(String prefix,long timeoutMs) throws Exception {
+              long deadline=System.nanoTime()+timeoutMs*1_000_000L;
+              while(System.nanoTime()<deadline && process!=null && process.isAlive()) {
+                if(reader.ready()) {
+                  String line=reader.readLine();
+                  if(line==null)break;
+                  if(line.contains("CRITICAL ERROR"))throw new IllegalArgumentException("Position refusée par Stockfish");
+                  if(line.startsWith(prefix))return line;
+                } else Thread.sleep(3);
+              }
+              return null;
+            }
+            private synchronized boolean ensureReady(){
+              if(process!=null&&process.isAlive())return true;
+              close();lastError="";
+              try {
+                File binary=new File(executable);
+                if(!binary.isFile())throw new IllegalStateException("Binaire Stockfish introuvable");
+                process=new ProcessBuilder(executable).redirectErrorStream(true).start();
+                reader=new BufferedReader(new InputStreamReader(process.getInputStream(),StandardCharsets.UTF_8));
+                writer=new BufferedWriter(new OutputStreamWriter(process.getOutputStream(),StandardCharsets.UTF_8));
+                command("uci");
+                if(readUntil("uciok",5000)==null)throw new IllegalStateException("Stockfish ne répond pas");
+                command("setoption name Threads value 1");
+                command("setoption name Hash value 16");
+                command("setoption name MultiPV value 1");
+                command("isready");
+                if(readUntil("readyok",5000)==null)throw new IllegalStateException("Initialisation Stockfish impossible");
+                return true;
+              }catch(Exception ex){lastError=ex.getClass().getSimpleName()+": "+ex.getMessage();close();return false;}
+            }
+            public void warmup(){ensureReady();}
+          
+            public synchronized List<TacticalEngine.Suggestion> analyze(Chess.Board board,List<StyleMode> styles,
+               int arrows,int timeMs,int depth){
+              if(board==null||!Chess.plausible(board)||Chess.inCheck(board,!board.whiteTurn))return Collections.emptyList();
+              List<Chess.Move> legal=Chess.legal(board);
+              if(legal.isEmpty())return Collections.emptyList();
+              if(!ensureReady())return Collections.emptyList();
+              try {
+                command("position fen "+board.fen());
+                command("go movetime "+THINK_MS);
+                String line=readUntil("bestmove ",800);
+                if(line==null){command("stop");line=readUntil("bestmove ",300);}
+                if(line==null){lastError="Délai de calcul dépassé";close();return Collections.emptyList();}
+                String[] tokens=line.trim().split("\\s+");
+                if(tokens.length<2)return Collections.emptyList();
+                for(Chess.Move m:legal)if(Chess.uci(m).equalsIgnoreCase(tokens[1])){
+                  lastError="";
+                  return Collections.singletonList(new TacticalEngine.Suggestion(m,0,StyleMode.FOU));
+                }
+                lastError="Coup proposé non légal pour la position lue";
+                return Collections.emptyList();
+              }catch(Exception ex){lastError=ex.getClass().getSimpleName()+": "+ex.getMessage();close();return Collections.emptyList();}
+            }
+            @Override public synchronized void close(){
+              if(process!=null){try{process.destroyForcibly();}catch(Exception ignored){}}
+              process=null;reader=null;writer=null;
+            }
+          }
+          JAVAENGINE
+          cp /tmp/StockfishEngine.java ChessFleches/app/src/main/java/fr/chessfleches/StockfishEngine.java
+          python3 - <<'PYV8'
+          from pathlib import Path
+          root=Path('ChessFleches/app/src/main/java/fr/chessfleches')
+          
+          def change(p,old,new,label):
+              s=p.read_text(encoding='utf-8')
+              n=s.count(old)
+              if n!=1: raise ValueError(f'V8 {label}: expected 1 occurrence; got {n}')
+              p.write_text(s.replace(old,new,1),encoding='utf-8')
+          
+          # Stockfish official UCI engine replaces the local handcrafted evaluation.
+          app=root/'CaptureService.java'
+          change(app,'private BoardVision vision;private Chess.Board game;private TacticalEngine engine;',
+                 'private BoardVision vision;private Chess.Board game;private StockfishEngine engine;', 'engine field')
+          change(app,'vision=new BoardVision(this);engine=new TacticalEngine();game=Chess.initial();loadSettings();',
+                 'vision=new BoardVision(this);engine=new StockfishEngine(getApplicationInfo().nativeLibraryDir+"/libstockfish.so");new Thread(()->engine.warmup(),"stockfish-init").start();game=Chess.initial();loadSettings();', 'initialization')
+          change(app,'worker.postDelayed(this::sample,900);','worker.postDelayed(this::sample,120);','first sampling')
+          change(app,'if(running)worker.postDelayed(this::sample,950);','if(running)worker.postDelayed(this::sample,65);','polling frequency')
+          change(app,'    },160);','    },35);','overlay hiding delay')
+          change(app,'      if(++frames%2!=0)return;','      if(++frames%2!=0)return;','scan path unchanged')
+          change(app,'List<TacticalEngine.Suggestion> top=engine.analyze(game,styles,count,Math.min(600,Math.max(250,effort*150)),effort);',
+                 'List<TacticalEngine.Suggestion> top=engine.analyze(game,styles,1,85,effort);','stockfish fast analysis')
+          change(app,'    else overlay.status("À toi · "+Chess.uci(arrows.get(0).move)+" · "+arrows.get(0).style.shortName());',
+                 '    else overlay.status("À toi · "+Chess.uci(arrows.get(0).move)+" · Stockfish 19");','status')
+          change(app,'    if(arrows.isEmpty())overlay.status("Aucun coup légal trouvé");',
+                 '    if(arrows.isEmpty())overlay.status("Pas de coup fiable · "+engine.error());','no silent fallback')
+          change(app,'    if(thread!=null)thread.quitSafely();if(overlay!=null)overlay.close();super.onDestroy();',
+                 '    if(engine!=null)engine.close();if(thread!=null)thread.quitSafely();if(overlay!=null)overlay.close();super.onDestroy();','cleanup')
+          
+          # Strictly one arrow, with validated move and no style bonuses.
+          # Keep the old TacticalEngine class only for the Suggestion data model.
+          
+          # On Android 10+, executable from data files is blocked. A packaged nativeLibraryDir
+          # path is executable, provided the binary is installed as an extracted legacy JNI lib.
+          gradle=Path('ChessFleches/app/build.gradle')
+          s=gradle.read_text(encoding='utf-8')
+          if 'packagingOptions' not in s:
+              s=s.replace('  compileOptions {','  packagingOptions { jniLibs { useLegacyPackaging true } }\n  compileOptions {',1)
+          s=s.replace('versionCode 2; versionName \'0.2\'','versionCode 8; versionName \'0.8-stockfish19\'')
+          gradle.write_text(s,encoding='utf-8')
+          manifest=Path('ChessFleches/app/src/main/AndroidManifest.xml')
+          s=manifest.read_text(encoding='utf-8')
+          s=s.replace('android:allowBackup="false"','android:allowBackup="false" android:extractNativeLibs="true"')
+          manifest.write_text(s,encoding='utf-8')
+          # Optional Patricia 5.1 engine for the exclusive FOU style; otherwise Stockfish 19.
+          change(app,'private BoardVision vision;private Chess.Board game;private StockfishEngine engine;',
+                 'private BoardVision vision;private Chess.Board game;private StockfishEngine engine;private StockfishEngine patricia;private String activeEngine="Stockfish 19";', 'dual engines')
+          change(app,'new Thread(()->engine.warmup(),"stockfish-init").start();game=Chess.initial();',
+                 'new Thread(()->engine.warmup(),"stockfish-init").start();patricia=new StockfishEngine(getApplicationInfo().nativeLibraryDir+"/libpatricia.so");new Thread(()->{if(new java.io.File(getApplicationInfo().nativeLibraryDir+"/libpatricia.so").isFile())patricia.warmup();},"patricia-init").start();game=Chess.initial();', 'patricia init')
+          change(app,'List<TacticalEngine.Suggestion> top=engine.analyze(game,styles,1,85,effort);',
+                 'StockfishEngine chosen=(styles.size()==1&&styles.contains(StyleMode.FOU)&&patricia!=null&&patricia.ready())?patricia:engine;\n      List<TacticalEngine.Suggestion> top=chosen.analyze(game,styles,1,85,effort);\n      if(top.isEmpty()&&chosen!=engine){chosen=engine;top=engine.analyze(game,styles,1,85,effort);}\n      activeEngine=chosen==engine?"Stockfish 19":"Patricia 5.1";', 'select engine')
+          change(app,'" · Stockfish 19");', '" · "+activeEngine);', 'active name')
+          change(app,'if(engine!=null)engine.close();if(thread!=null)',
+                 'if(engine!=null)engine.close();if(patricia!=null)patricia.close();if(thread!=null)', 'close both engines')
+          print('V8 engines and low-latency capture patches applied')
+          PYV8
+          echo 'Verify extracted Stockfish binary and Java source'
+          test -s ChessFleches/app/src/main/jniLibs/arm64-v8a/libstockfish.so
+          test -s ChessFleches/app/src/main/java/fr/chessfleches/StockfishEngine.java
+
+      - name: Detection automatique du coup adverse et fleche immediate V9
+        shell: bash
+        run: |
+          python3 - <<'PYV9'
+          from pathlib import Path
+          
+          root=Path('ChessFleches/app/src/main/java/fr/chessfleches')
+          p=root/'CaptureService.java'
+          s=p.read_text(encoding='utf-8')
+          old='''        if(after!=null&&vision.positionMatches(image,after,white)){
+                    lostFrames=0;
+                    String uci=Chess.uci(next);
+                    if(uci.equals(pending))same++;else{pending=uci;same=1;}
+                    if(same>=2){game=after;pending="";same=0;}
+                    overlay.show(vision.board(),new ArrayList<>(),white);
+                    overlay.status("Verification du coup · analyse actualisee");
+                    return;
+                  }
+                  pending="";same=0;
+                  overlay.show(vision.board(),new ArrayList<>(),white);
+                  overlay.status("Position differente · resynchronisation");
+                  if(++lostFrames>=3)resetSession();
+                  return;
+          '''
+          new='''        if(after!=null&&vision.positionMatches(image,after,white)){
+                    // The legal opponent move is already confirmed by the *current* pixels.
+                    // Commit in this very frame and calculate the reply below: no second
+                    // snapshot / extra wait needed for live, short-time-control chess.
+                    game=after;
+                    lostFrames=0;pending="";same=0;analyzed="";
+                  }else{
+                    pending="";same=0;
+                    overlay.show(vision.board(),new ArrayList<>(),white);
+                    overlay.status("Position differente · resynchronisation");
+                    if(++lostFrames>=3)resetSession();
+                    return;
+                  }
+          '''
+          assert s.count(old)==1, 'Expected V8 code anchor missing (opponent move sync)'
+          s=s.replace(old,new,1)
+          # Lower time between samples while keeping at least one Android display refresh
+          # with the arrows hidden, so the capture doesn't include our own overlay.
+          old='''      if(running)worker.postDelayed(this::sample,65);
+              },35);'''
+          new='''      if(running)worker.postDelayed(this::sample,20);
+              },24);'''
+          assert s.count(old)==1, 'Expected V8 sample cadence missing'
+          s=s.replace(old,new,1)
+          # Avoid frame starvation waiting for second identical screenshot during startup.
+          # The first read has already been checked against silhouettes and king constraints.
+          # Keep the startup stabilizer (2 consistent reads), because false initial recognition
+          # is a bigger risk than tens of ms during the very first calibration.
+          
+          # Analyze exactly once as soon as current image is confirmed with the new turn.
+          assert 'game=after;\n          lostFrames=0;' in s
+          p.write_text(s,encoding='utf-8')
+          print('V9: live automatic response without extra captured frame; no tap necessary')
+          PYV9
+
+      - name: Fleche persistante et capture Chess Universe V10
+        shell: bash
+        run: |
+          python3 - <<'PYV10'
+          from pathlib import Path
+          root=Path('ChessFleches/app/src/main/java/fr/chessfleches')
+          def change(s,old,new,note):
+              count=s.count(old)
+              if count!=1: raise RuntimeError(f'V10 {note}: expected one match, got {count}: {old[:80]!r}')
+              return s.replace(old,new,1)
+
+          service=root/'CaptureService.java'
+          s=service.read_text(encoding='utf-8')
+          # V9 switches the overlay off at every screenshot. With selected-app capture,
+          # Android captures Chess Universe without any content from our overlay.
+          s=change(s,'    if(overlay!=null)overlay.hideForSampling(true);\n','', 'leave arrow visible before sampling')
+          s=change(s,'        if(overlay!=null)overlay.hideForSampling(false);\n','', 'leave arrow visible after sampling')
+          # A single bad frame should not erase the arrow.
+          s=change(s,'  private String pending="",scanPending="",analyzed="";private int same=0,scanSame=0,frames=0,lostFrames=0;',
+                   '  private String pending="",scanPending="",analyzed="";private int same=0,scanSame=0,frames=0,lostFrames=0,missingFrames=0;', 'missing counter')
+          s=change(s,'same=0;frames=0;lostFrames=0;analyzed="";',
+                   'same=0;frames=0;lostFrames=0;missingFrames=0;analyzed="";', 'clear missing')
+          s=change(s,'''    if(visible==null){
+                vision.reset();game=null;scanPending="";scanSame=0;
+                pending="";same=0;analyzed="";arrows.clear();
+                overlay.show(null,new ArrayList<>(),white);
+                overlay.status("Aucun echiquier detecte");
+                return;
+              }
+          ''','''    if(visible==null){
+                // Never flicker the arrow because one display frame was dropped.
+                if(++missingFrames<8)return;
+                resetSession();
+                overlay.status("Echiquier indisponible · nouvelle detection");
+                return;
+              }
+              missingFrames=0;
+          ''','persist on dropped frame')
+          s=change(s,'''          pending="";same=0;
+                    overlay.show(vision.board(),new ArrayList<>(),white);
+                    overlay.status("Position differente · resynchronisation");
+                    if(++lostFrames>=3)resetSession();
+                    return;
+          ''','''          pending="";same=0;
+                    // Move animations are temporarily inconsistent: avoid blinking.
+                    if(++lostFrames>=8){
+                      resetSession();
+                      overlay.status("Position incertaine · nouveau scan");
+                    }
+                    return;
+          ''','persist on animated transition')
+          s=change(s,'private int width,height,count=3,effort=3;', 'private int width,height,count=1,effort=3;', 'one arrow default')
+          s=change(s,'p.getInt("count",3)', 'p.getInt("count",1)', 'one arrow settings default')
+          service.write_text(s,encoding='utf-8')
+
+          main=root/'MainActivity.java'
+          a=main.read_text(encoding='utf-8')
+          a=change(a,'prefs.getInt("count",3)-1','prefs.getInt("count",1)-1','main one arrow default')
+          a=change(a,'    startActivityForResult(mgr.createScreenCaptureIntent(),CAPTURE_REQUEST);', '''    // Keep our drawing layer on-screen: share only the Chess Universe app.
+              // With full-screen sharing the overlay may be recorded along with the board.
+              if(Build.VERSION.SDK_INT>=34){
+                new AlertDialog.Builder(this)
+                  .setTitle("Flèches fixes sans clignotement")
+                  .setMessage("Dans la fenêtre Android, choisis UNE SEULE APPLICATION puis Chess Universe. Pas ECRAN ENTIER : cela enregistrerait aussi la flèche.")
+                  .setPositiveButton("Choisir Chess Universe",(dialog,which)->startActivityForResult(mgr.createScreenCaptureIntent(),CAPTURE_REQUEST))
+                  .setNegativeButton("Annuler",null).show();
+              }else{
+                startActivityForResult(mgr.createScreenCaptureIntent(),CAPTURE_REQUEST);
+              }''', 'prompt one app')
+          a=change(a,'"Version 0.2 · positions déjà commencées (expérimental)"', '"Version V10 · flèche stable · capture Chess Universe"', 'correct version')
+          a=change(a,'"Moteur intégré ≠ Stockfish. Détection de positions expérimentale : s\'il y a un doute, aucune flèche ne doit s\'afficher. Utilise-le pour l\'entraînement contre l\'ordinateur."',
+                   '"Stockfish 19 · Patricia si disponible. Choisis UNE SEULE APPLICATION pendant la capture pour garder les flèches fixes. Détection expérimentale : teste sans chronomètre."', 'update help')
+          main.write_text(a,encoding='utf-8')
+
+          build=Path('ChessFleches/app/build.gradle')
+          b=build.read_text(encoding='utf-8')
+          b=change(b,"versionCode 8; versionName '0.8-stockfish19'", "versionCode 10; versionName '1.0-fleche-stable'", 'APK version upgrade')
+          build.write_text(b,encoding='utf-8')
+          print('V10: persistent arrow, capture only selected app, transient dropouts debounced')
+          PYV10
+
+      - name: Corriger echecs et roques; activer PIÉGEUR FOU V12
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > ChessFleches/app/src/main/java/fr/chessfleches/AlienGambit.java <<'JAVAALIEN'
+          package fr.chessfleches;
+
+          import java.util.Arrays;
+          import java.util.List;
+
+          /** Optional opening repertoire, only when the opponent actually plays the Caro-Kann line. */
+          public final class AlienGambit {
+            private AlienGambit() {}
+            private static final String[][] LINES = {
+              {"e2e4","c7c6","d2d4","d7d5","b1c3","d5e4","c3e4","g8f6","e4g5","h7h6","g5f7"},
+              {"e2e4","c7c6","d2d4","d7d5","b1d2","d5e4","d2e4","g8f6","e4g5","h7h6","g5f7"}
+            };
+            private static Chess.Move legalUci(Chess.Board board,String uci) {
+              for(Chess.Move m:Chess.legal(board))if(Chess.uci(m).equals(uci))return m;
+              return null;
+            }
+            public static Chess.Move suggest(Chess.Board board,List<Chess.Move> legal) {
+              if(board==null||!board.whiteTurn)return null;
+              for(String[] line:LINES) {
+                Chess.Board position=Chess.initial();
+                for(int i=0;i<line.length;i++) {
+                  if(i%2==0 && position.whiteTurn==board.whiteTurn && Arrays.equals(position.b,board.b)) {
+                    for(Chess.Move m:legal)if(Chess.uci(m).equals(line[i]))return m;
+                  }
+                  Chess.Move m=legalUci(position,line[i]);
+                  if(m==null)break;
+                  position=Chess.move(position,m);
+                }
+              }
+              return null;
+            }
+          }
+          JAVAALIEN
+          cat > ChessFleches/app/src/main/java/fr/chessfleches/StockfishEngine.java <<'JAVASTOCKFISH'
+          package fr.chessfleches;
+
+          import java.io.BufferedReader;
+          import java.io.BufferedWriter;
+          import java.io.InputStreamReader;
+          import java.io.OutputStreamWriter;
+          import java.io.File;
+          import java.nio.charset.StandardCharsets;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.HashMap;
+          import java.util.List;
+          import java.util.Map;
+
+          /** V10 fast UCI engine + an optional forcing-play mode. One validated arrow only. */
+          public final class StockfishEngine implements AutoCloseable {
+            private final String executable;
+            private Process process;
+            private BufferedReader reader;
+            private BufferedWriter writer;
+            private String lastError="";
+            private int multiPV=1;
+            public StockfishEngine(String path){executable=path;}
+            public synchronized String error(){return lastError;}
+            public synchronized boolean ready(){return process!=null&&process.isAlive();}
+            private void command(String msg) throws Exception {writer.write(msg);writer.write('\n');writer.flush();}
+            private String readUntil(String prefix,long timeoutMs) throws Exception {
+              long deadline=System.nanoTime()+timeoutMs*1_000_000L;
+              while(System.nanoTime()<deadline&&process!=null&&process.isAlive()){
+                if(reader.ready()){
+                  String line=reader.readLine();if(line==null)break;
+                  if(line.contains("CRITICAL ERROR"))throw new IllegalArgumentException("Position refusée par Stockfish");
+                  if(line.startsWith(prefix))return line;
+                }else Thread.sleep(3);
+              }
+              return null;
+            }
+            private synchronized boolean ensureReady(){
+              if(ready())return true;
+              close();lastError="";
+              try{
+                File binary=new File(executable);
+                if(!binary.isFile())throw new IllegalStateException("Binaire moteur introuvable");
+                process=new ProcessBuilder(executable).redirectErrorStream(true).start();
+                reader=new BufferedReader(new InputStreamReader(process.getInputStream(),StandardCharsets.UTF_8));
+                writer=new BufferedWriter(new OutputStreamWriter(process.getOutputStream(),StandardCharsets.UTF_8));
+                command("uci");if(readUntil("uciok",5000)==null)throw new IllegalStateException("Moteur UCI sans réponse");
+                command("setoption name Threads value 1");
+                command("setoption name Hash value 16");
+                command("setoption name MultiPV value 1");multiPV=1;
+                command("isready");if(readUntil("readyok",5000)==null)throw new IllegalStateException("Moteur non prêt");
+                return true;
+              }catch(Exception ex){lastError=ex.getClass().getSimpleName()+": "+ex.getMessage();close();return false;}
+            }
+            public void warmup(){ensureReady();}
+            private static final class Candidate {
+              String uci;int score,depth;boolean mate;
+              Candidate(String u,int s,int d,boolean m){uci=u;score=s;depth=d;mate=m;}
+            }
+            private static Candidate parseInfo(String line,Map<Integer,Candidate> results){
+              if(!line.startsWith("info ")||!line.contains(" pv ")||!line.contains(" score "))return null;
+              String[] t=line.trim().split("\\s+");
+              int pv=1,depth=-1,score=0;boolean scored=false,mate=false;String uci=null;
+              try {
+                for(int i=1;i<t.length;i++){
+                  if("depth".equals(t[i])&&i+1<t.length)depth=Integer.parseInt(t[i+1]);
+                  else if("multipv".equals(t[i])&&i+1<t.length)pv=Integer.parseInt(t[i+1]);
+                  else if("score".equals(t[i])&&i+2<t.length){
+                    if("cp".equals(t[i+1])){score=Integer.parseInt(t[i+2]);scored=true;}
+                    else if("mate".equals(t[i+1])){
+                      int ply=Integer.parseInt(t[i+2]);
+                      score=ply>0?29000-Math.min(200,ply)*100:-29000+Math.min(200,-ply)*100;
+                      scored=true;mate=true;
+                    }
+                  } else if("pv".equals(t[i])&&i+1<t.length){uci=t[i+1];break;}
+                }
+              } catch(NumberFormatException ignored){return null;}
+              if(!scored||uci==null||depth<0||pv<1||pv>5)return null;
+              Candidate c=new Candidate(uci,score,depth,mate);
+              Candidate previous=results.get(pv);
+              if(previous==null||depth>=previous.depth)results.put(pv,c);
+              return c;
+            }
+            private static Chess.Move find(List<Chess.Move> legal,String uci){
+              if(uci==null)return null;
+              for(Chess.Move m:legal)if(Chess.uci(m).equalsIgnoreCase(uci))return m;
+              return null;
+            }
+            /** Practical aggression only for moves within 0.55 pawn of Stockfish's best evaluation. */
+            private static int tacticalScore(Chess.Board board,Chess.Move m){
+              Chess.Board after=Chess.move(board,m);
+              int score=0;
+              if(Chess.inCheck(after,after.whiteTurn))score+=40;
+              if(m.promotion!='.')score+=35;
+              if(m.castle)score+=8;
+              if(board.b[m.to]!='.')score+=Math.min(12,Chess.pieceValue(board.b[m.to])/50);
+              int enemyKing=-1;
+              char enemy=board.whiteTurn?'k':'K';
+              for(int i=0;i<64;i++)if(board.b[i]==enemy){enemyKing=i;break;}
+              if(enemyKing>=0){
+                int distance=Math.abs(Chess.row(m.to)-Chess.row(enemyKing))+
+                             Math.abs(Chess.col(m.to)-Chess.col(enemyKing));
+                char piece=Character.toLowerCase(board.b[m.from]);
+                if(piece=='n'||piece=='b'||piece=='r'||piece=='q')score+=Math.max(0,10-distance)*2;
+              }
+              return score;
+            }
+            private static Chess.Move chooseTrapMove(Chess.Board board,List<Chess.Move> legal,
+                                                    String bestmove,Map<Integer,Candidate> variations){
+              Chess.Move fallback=find(legal,bestmove);
+              if(fallback==null)return null;
+              Candidate strongest=variations.get(1);
+              if(strongest==null||strongest.mate&&strongest.score>0)return fallback;
+              int threshold=strongest.score-55;
+              int preferred=Integer.MIN_VALUE;Chess.Move choice=fallback;
+              for(Candidate c:variations.values()){
+                Chess.Move m=find(legal,c.uci);
+                if(m==null||c.score<threshold||c.mate&&c.score<0)continue;
+                int value=c.score-strongest.score+tacticalScore(board,m);
+                if(value>preferred){preferred=value;choice=m;}
+              }
+              return choice;
+            }
+            public synchronized List<TacticalEngine.Suggestion> analyze(Chess.Board board,List<StyleMode> styles,
+                int arrows,int timeMs,int depth){
+              if(board==null||!Chess.plausible(board)||Chess.inCheck(board,!board.whiteTurn))return Collections.emptyList();
+              List<Chess.Move> legal=Chess.legal(board);
+              if(legal.isEmpty())return Collections.emptyList();
+              boolean traps=styles!=null&&styles.contains(StyleMode.PIEGEUR_FOU);
+              // The gambit is an *explicit* risky opening choice. It can fail against best defence.
+              if(traps){
+                Chess.Move book=AlienGambit.suggest(board,legal);
+                if(book!=null)return Collections.singletonList(new TacticalEngine.Suggestion(book,0,StyleMode.PIEGEUR_FOU));
+              }
+              if(!ensureReady())return Collections.emptyList();
+              try{
+                int requested=traps?3:1;
+                if(requested!=multiPV){command("setoption name MultiPV value "+requested);multiPV=requested;}
+                command("position fen "+board.fen());
+                command("go movetime "+(traps?110:85));
+                String bestmove=null;
+                Map<Integer,Candidate> variations=new HashMap<>();
+                long deadline=System.nanoTime()+850_000_000L;
+                while(System.nanoTime()<deadline&&ready()){
+                  if(reader.ready()){
+                    String line=reader.readLine();if(line==null)break;
+                    if(line.startsWith("info "))parseInfo(line,variations);
+                    else if(line.startsWith("bestmove ")){String[] t=line.trim().split("\\s+");if(t.length>1)bestmove=t[1];break;}
+                  } else Thread.sleep(2);
+                }
+                if(bestmove==null){
+                  command("stop");String line=readUntil("bestmove ",250);
+                  if(line!=null){String[] t=line.trim().split("\\s+");if(t.length>1)bestmove=t[1];}
+                }
+                if(bestmove==null){lastError="Moteur trop lent";close();return Collections.emptyList();}
+                Chess.Move selected=traps?chooseTrapMove(board,legal,bestmove,variations):find(legal,bestmove);
+                if(selected==null){lastError="Coup moteur non légal";return Collections.emptyList();}
+                lastError="";
+                return Collections.singletonList(new TacticalEngine.Suggestion(selected,0,
+                  traps?StyleMode.PIEGEUR_FOU:StyleMode.FOU));
+              }catch(Exception ex){lastError=ex.getClass().getSimpleName()+": "+ex.getMessage();close();return Collections.emptyList();}
+            }
+            @Override public synchronized void close(){
+              if(process!=null)try{process.destroyForcibly();}catch(Exception ignored){}
+              process=null;reader=null;writer=null;multiPV=1;
+            }
+          }
+          JAVASTOCKFISH
+          python3 - <<'PYV12'
+          #!/usr/bin/env python3
+          """Applied after V10. Patch only the existing V10 Java tree; leave V10 alone on main."""
+          from pathlib import Path
+          root = Path('ChessFleches/app/src/main/java/fr/chessfleches')
+
+          def replace(name, old, new, note):
+              p=root/name
+              s=p.read_text(encoding='utf-8')
+              n=s.count(old)
+              if n!=1: raise RuntimeError(f'V10+ {note}: expected 1 match, got {n}')
+              p.write_text(s.replace(old,new,1),encoding='utf-8')
+
+          replace('Chess.java',
+              '  public static Board initial(){',
+              '''  /** In an imported position castling history is unknowable. This is only a
+             *  geometric guess, offered as an option in settings, never a proof. */
+            public static int castlingFromPlacement(Board b){
+              int rights=0;
+              if(b.b[60]=='K'){
+                if(b.b[63]=='R')rights|=CASTLE_WK;
+                if(b.b[56]=='R')rights|=CASTLE_WQ;
+              }
+              if(b.b[4]=='k'){
+                if(b.b[7]=='r')rights|=CASTLE_BK;
+                if(b.b[0]=='r')rights|=CASTLE_BQ;
+              }
+              return rights;
+            }
+            public static Board initial(){''','castling placement helper')
+          replace('BoardVision.java',
+              '    if(unsure>9||!Chess.plausible(found))return null;\n    return new VisionCandidate(rect,found,total+2*unsure);',
+              '    if(unsure>9||!Chess.plausible(found))return null;\n    found.rights=Chess.castlingFromPlacement(found);\n    return new VisionCandidate(rect,found,total+2*unsure);',
+              'reconstruction of castling rights')
+          replace('BoardVision.java',
+              '''    for(int r=0;r<8;r++)for(int c=0;c<8;c++){
+                boolean expectedOccupied=expected.b[internal(r,c,whiteBottom)]!='.';
+                if(visiblyOccupied(image,board,r,c)!=expectedOccupied)return false;
+              }
+              return true;
+            }
+            /** Apprentissage''',
+              '''    // During check Chess Universe draws flames on the king. Trust the last
+              // known king square temporarily, but still verify the other 63 squares.
+              boolean checkOverlay=Chess.inCheck(expected,true)||Chess.inCheck(expected,false);
+              for(int r=0;r<8;r++)for(int c=0;c<8;c++){
+                char piece=expected.b[internal(r,c,whiteBottom)];
+                if(checkOverlay&&(piece=='K'||piece=='k'))continue;
+                boolean expectedOccupied=piece!='.';
+                if(visiblyOccupied(image,board,r,c)!=expectedOccupied)return false;
+              }
+              return true;
+            }
+            /** Apprentissage''',
+              'ignore king flame during check only')
+          replace('StyleMode.java',
+              '  PIEGES("Pièges · menaces", 0xFFFFB443);',
+              '  PIEGES("Pièges · menaces", 0xFFFFB443),\n  PIEGEUR_FOU("PIÉGEUR FOU 🔥 · Alien / mat / attaque", 0xFFFF8F30);',
+              'new attacking mode')
+          replace('MainActivity.java',
+              '  private EditText fen;',
+              '  private EditText fen;private CheckBox castleAssume;',
+              'checkbox field')
+          replace('MainActivity.java',
+              '    root.addView(label("Fou : privilégie les échecs, gambits, sacrifices et attaques calculées. Inspiré de l\'idée du mode Fou, sans utiliser ni reproduire le moteur de Chess & Checkers.",13));',
+              '''    root.addView(label("Piégeur fou : tente l'Alien Gambit contre la Caro-Kann, puis privilégie les coups forçants proches du meilleur score Stockfish. Nxf7 peut être risqué contre un bon joueur.",13));
+              castleAssume=new CheckBox(this);
+              castleAssume.setText("Autoriser le roque si le roi et la tour semblent à leur place");
+              castleAssume.setTextColor(Color.WHITE);
+              castleAssume.setChecked(prefs.getBoolean("castleAssume",true));
+              root.addView(castleAssume);
+              root.addView(label("Pour une partie reprise, l'image ne permet pas de savoir si roi ou tour ont déjà bougé. Désactive cette case en cas de doute.",12));''',
+              'new mode and castle controls')
+          replace('MainActivity.java',
+              '.putInt("count",countSeek.getProgress()+1).putInt("effort",effortSeek.getProgress()+1).putString("fen",custom);',
+              '.putInt("count",countSeek.getProgress()+1).putInt("effort",effortSeek.getProgress()+1).putString("fen",custom)\n       .putBoolean("castleAssume",castleAssume.isChecked());',
+              'persist castle preference')
+          replace('MainActivity.java',
+              '"Version V10 · flèche stable · capture Chess Universe"',
+              '"Version V10+ · roque · échec animé · piégeur fou"',
+              'version label')
+          replace('CaptureService.java',
+              '  private boolean white=true, myTurnFirst=true;',
+              '  private boolean white=true, myTurnFirst=true,castleAssume=true;',
+              'castle service flag')
+          replace('CaptureService.java',
+              '    white=p.getBoolean("white",true);myTurnFirst=p.getBoolean("myTurnFirst",true);',
+              '    white=p.getBoolean("white",true);myTurnFirst=p.getBoolean("myTurnFirst",true);\n    castleAssume=p.getBoolean("castleAssume",true);',
+              'castle preference load')
+          replace('CaptureService.java',
+              '      boolean oldWhite=white,oldTurn=myTurnFirst;String oldFen=customFen;',
+              '      boolean oldWhite=white,oldTurn=myTurnFirst,oldCastle=castleAssume;String oldFen=customFen;',
+              'settings old castle')
+          replace('CaptureService.java',
+              '      if(oldWhite!=white||oldTurn!=myTurnFirst||!oldFen.equals(customFen))resetSession();',
+              '      if(oldWhite!=white||oldTurn!=myTurnFirst||oldCastle!=castleAssume||!oldFen.equals(customFen))resetSession();',
+              'settings update')
+          replace('CaptureService.java',
+              '''      }else scanned=vision.scanPosition(image,rect,white,myTurnFirst==white);
+                if(scanned==null)''',
+              '''      }else{
+                  scanned=vision.scanPosition(image,rect,white,myTurnFirst==white);
+                  if(scanned!=null&&!castleAssume)scanned.rights=0;
+                }
+                if(scanned==null)''',
+              'guess rights only when enabled and never overwrite custom FEN')
+          replace('CaptureService.java',
+              '''        Chess.Move next=vision.detectMove(image,game,white);
+                  Chess.Board after=next==null?null:Chess.move(game,next);''',
+              '''        // A castle moves two pieces at once; test that legal transition first.
+                  Chess.Move next=null;
+                  for(Chess.Move move:Chess.legal(game)){
+                    if(move.castle && vision.positionMatches(image,Chess.move(game,move),white)){
+                      next=move;break;
+                    }
+                  }
+                  if(next==null)next=vision.detectMove(image,game,white);
+                  Chess.Board after=next==null?null:Chess.move(game,next);''',
+              'opponent castle special detection')
+          replace('CaptureService.java',
+              '    else overlay.status("À toi · "+Chess.uci(arrows.get(0).move)+" · "+activeEngine);',
+              '    else overlay.status("À toi · "+Chess.uci(arrows.get(0).move)+" · "+activeEngine+(styles.contains(StyleMode.PIEGEUR_FOU)?" · PIÉGEUR FOU":""));',
+              'attacking label')
+
+          build=Path('ChessFleches/app/build.gradle')
+          s=build.read_text(encoding='utf-8')
+          a="versionCode 10; versionName '1.0-fleche-stable'"
+          assert s.count(a)==1
+          s=s.replace(a,"versionCode 12; versionName '1.2-piegeur-fou'",1)
+          # Independent APK: debug signatures are regenerated by GitHub Actions.
+          # Preserve the known-good V10 installed on the phone while trying V12.
+          assert s.count("applicationId 'fr.chessfleches';")==1
+          s=s.replace("applicationId 'fr.chessfleches';","applicationId 'fr.chessfleches.piegeurfou';",1)
+          build.write_text(s,encoding='utf-8')
+          manifest=Path('ChessFleches/app/src/main/AndroidManifest.xml')
+          m=manifest.read_text(encoding='utf-8')
+          assert m.count('android:label="Chess Flèches"')==1
+          manifest.write_text(m.replace('android:label="Chess Flèches"','android:label="Chess Flèches V12"',1),encoding='utf-8')
+          print('V10+ : castle/check flash/trap mode patched')
+          PYV12
+          mkdir -p /tmp/chess-v12-test
+          javac -encoding UTF-8 -d /tmp/chess-v12-test \
+            ChessFleches/app/src/main/java/fr/chessfleches/{Chess,StyleMode,TacticalEngine,AlienGambit,StockfishEngine}.java
+          echo "V12 OK - moteur, roque et repertoire Alien compiles"
+
+      - name: Suivi instantane du roi et roque V13
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYV13'
+          from pathlib import Path
+          root=Path('ChessFleches/app/src/main/java/fr/chessfleches')
+          
+          def once(path,old,new,name):
+              p=root/path
+              s=p.read_text(encoding='utf-8')
+              n=s.count(old)
+              if n!=1: raise RuntimeError(f'{name}: expected 1 anchor, found {n}')
+              p.write_text(s.replace(old,new,1),encoding='utf-8')
+          
+          root.joinpath('KingMoveEvidence.java').write_text('''package fr.chessfleches;
+          
+          /** Quick, silhouette-only recovery for a moving king (including castles).
+           * This runs only after the previous king square becomes visibly empty. */
+          public final class KingMoveEvidence {
+            private KingMoveEvidence() {}
+          
+            public static Chess.Move detect(Chess.Board before, boolean[] occupied, boolean[] highlighted) {
+              if(before==null||occupied==null||occupied.length!=64||highlighted==null||highlighted.length!=64)return null;
+              final char king=before.whiteTurn?'K':'k';
+              int from=-1;
+              for(int i=0;i<64;i++)if(before.b[i]==king){from=i;break;}
+              // Never treat check flames or a temporarily hidden sprite as a confirmed move.
+              if(from<0||occupied[from])return null;
+          
+              Chess.Move found=null;
+              for(Chess.Move candidate:Chess.legal(before)){
+                if(candidate.from!=from || !occupied[candidate.to])continue;
+                boolean yellowPair=highlighted[from]&&highlighted[candidate.to];
+                // For a king capture, occupancy alone cannot tell which piece is on the
+                // target square; require Chess Universe's highlighted last-move squares.
+                if(before.b[candidate.to]!='.'&&!yellowPair)continue;
+                Chess.Board after=Chess.move(before,candidate);
+                int mismatch=0;
+                boolean otherMismatch=false;
+                for(int cell=0;cell<64;cell++){
+                  if(cell==from||cell==candidate.to)continue;
+                  if(occupied[cell]!=(after.b[cell]!='.')){
+                    mismatch++;
+                    // A check/capture glow can spill onto an adjacent king square.
+                    if(Math.abs(Chess.row(cell)-Chess.row(candidate.to))>1||
+                       Math.abs(Chess.col(cell)-Chess.col(candidate.to))>1)otherMismatch=true;
+                  }
+                }
+                if(otherMismatch||mismatch>(yellowPair?1:0))continue;
+                // A unique legal king transition was observed in the same screenshot.
+                if(found!=null)return null;
+                found=candidate;
+              }
+              return found;
+            }
+          }
+          ''',encoding='utf-8')
+          
+          once('BoardVision.java',
+          '''  /** Fast verification: stop rather than displaying arrows for moved/missing pieces. */''',
+          '''  /** Chess Universe displays the previous move on yellow squares. Read the
+             * outside corners so the animated king cannot hide the background colour. */
+            private boolean highlighted(Bitmap image,Box rect,int r,int c){
+              double side=rect.size/8.0;
+              double[] bg=BG[(r+c)&1];
+              double dr=0,dg=0,db=0;
+              for(double yy:new double[]{.12,.88})for(double xx:new double[]{.12,.88}){
+                int px=pixel(image,(int)Math.round(rect.x+(c+xx)*side),
+                                     (int)Math.round(rect.y+(r+yy)*side));
+                dr+=channel(px,16)-bg[0];dg+=channel(px,8)-bg[1];db+=channel(px,0)-bg[2];
+              }
+              double dist=Math.sqrt((dr*dr+dg*dg+db*db)/48.0);
+              return dist>19.0;
+            }
+            /** Detect a king move before relying on sprite similarity. Also handles
+             * the four-square silhouette change of castling. Returns legal moves only. */
+            public Chess.Move detectKingTransition(Bitmap image,Chess.Board current,boolean whiteBottom){
+              if(image==null||board==null||current==null||image.getWidth()!=board.size)return null;
+              int source=-1;char king=current.whiteTurn?'K':'k';
+              for(int i=0;i<64;i++)if(current.b[i]==king){source=i;break;}
+              if(source<0)return null;
+              int sr=whiteBottom?source/8:7-source/8;
+              int sc=whiteBottom?source%8:7-source%8;
+              // Fast path: while the king is still on its old square, do no extra work.
+              if(visiblyOccupied(image,board,sr,sc))return null;
+              boolean[] occupied=new boolean[64],yellow=new boolean[64];
+              for(int r=0;r<8;r++)for(int c=0;c<8;c++){
+                int square=internal(r,c,whiteBottom);
+                occupied[square]=visiblyOccupied(image,board,r,c);
+                yellow[square]=highlighted(image,board,r,c);
+              }
+              return KingMoveEvidence.detect(current,occupied,yellow);
+            }
+            /** Fast verification: stop rather than displaying arrows for moved/missing pieces. */''',
+          'king detection method')
+          
+          once('CaptureService.java',
+          '''      vision.align(visible);
+                if(!vision.positionMatches(image,game,white)){''',
+          '''      vision.align(visible);
+                // Detect king moves directly from vacated/occupied squares: animated kings
+                // and the yellow last-move highlight are unreliable for sprite matching.
+                Chess.Move movedKing=vision.detectKingTransition(image,game,white);
+                if(movedKing!=null){
+                  game=Chess.move(game,movedKing);
+                  lostFrames=0;pending="";same=0;analyzed="";arrows.clear();
+                }else if(!vision.positionMatches(image,game,white)){''',
+          'early king transition detection')
+          # Do not purge state while Chess Universe renders the king/check glow (~<1s).
+          once('CaptureService.java',
+          '''if(++lostFrames>=8){
+                      resetSession();''',
+          '''if(++lostFrames>=24){
+                      resetSession();''',
+          'king animation tolerance')
+          
+          once('MainActivity.java',
+          '"Version V10+ · roque · échec animé · piégeur fou"',
+          '"Version V13 · mouvement roi/roque · piégeur fou"',
+          'version label')
+          
+          build=Path('ChessFleches/app/build.gradle'); b=build.read_text(encoding='utf-8')
+          assert b.count("versionCode 12; versionName '1.2-piegeur-fou'")==1
+          b=b.replace("versionCode 12; versionName '1.2-piegeur-fou'", "versionCode 13; versionName '1.3-roi-fiable'",1)
+          # Let V10 and V12 remain installed as known-good fallbacks.
+          assert b.count("applicationId 'fr.chessfleches.piegeurfou'")==1
+          b=b.replace("applicationId 'fr.chessfleches.piegeurfou'","applicationId 'fr.chessfleches.piegeurfou.v13'",1)
+          build.write_text(b,encoding='utf-8')
+          manifest=Path('ChessFleches/app/src/main/AndroidManifest.xml'); m=manifest.read_text(encoding='utf-8')
+          assert m.count('android:label="Chess Flèches V12"')==1
+          manifest.write_text(m.replace('android:label="Chess Flèches V12"','android:label="Chess Flèches V13"',1),encoding='utf-8')
+          print('V13: king transition recovered via occupied squares, last-move highlights and castling')
+          PYV13
+          cat > /tmp/TestKingV13.java <<'JAVAKINGTEST'
+          package fr.chessfleches;
+          
+          public final class TestKingV13 {
+           static void verify(boolean ok,String message){if(!ok)throw new AssertionError(message);}
+           static Chess.Move find(Chess.Board board,String uci){for(Chess.Move m:Chess.legal(board))if(uci.equals(Chess.uci(m)))return m;throw new AssertionError("not legal "+uci+" in "+board.fen());}
+           static boolean[] occ(Chess.Board board){boolean[] values=new boolean[64];for(int i=0;i<64;i++)values[i]=board.b[i]!='.';return values;}
+           static boolean[] mark(Chess.Move move){boolean[] yellow=new boolean[64];yellow[move.from]=true;yellow[move.to]=true;return yellow;}
+           static void test(String fen,String uci){
+            Chess.Board before=Chess.fromFen(fen);
+            Chess.Move m=find(before,uci);
+            Chess.Board after=Chess.move(before,m);
+            Chess.Move detected=KingMoveEvidence.detect(before,occ(after),mark(m));
+            verify(detected!=null && Chess.uci(detected).equals(uci),"failed to find "+uci);
+            verify(KingMoveEvidence.detect(before,occ(before),mark(m))==null,"false positive in old position");
+            if(before.b[m.to]=='.'){
+              verify(KingMoveEvidence.detect(before,occ(after),new boolean[64])!=null,"normal king move without highlight "+uci);
+            }else{
+              verify(KingMoveEvidence.detect(before,occ(after),new boolean[64])==null,"capture without highlight accepted "+uci);
+            }
+           }
+           public static void main(String[] args){
+            // Position reconstructed from the supplied king-on-f2 screenshot.
+            test("r5k1/1p3rpp/p7/n2b1p2/8/5P2/PB4P1/R5K1 w - - 0 1","g1f2");
+            test("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1","e1g1");
+            test("4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1","e1c1");
+            test("4k3/8/8/8/8/8/8/R3K2R b KQ - 0 1","e8d7");
+            test("k7/8/8/8/8/8/5p2/6K1 w - - 0 1","g1f2");
+            System.out.println("OK: king f2 screenshot, kings moves, castling and captures");
+           }
+          }
+          JAVAKINGTEST
+          mkdir -p /tmp/chess-v13-test
+          javac -encoding UTF-8 -d /tmp/chess-v13-test \
+            ChessFleches/app/src/main/java/fr/chessfleches/Chess.java \
+            ChessFleches/app/src/main/java/fr/chessfleches/KingMoveEvidence.java \
+            /tmp/TestKingV13.java
+          java -cp /tmp/chess-v13-test fr.chessfleches.TestKingV13
+
+      - name: Ajouter mode REINE CHASSEUSE V14 (sortie precoce, pions, securite)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > ChessFleches/app/src/main/java/fr/chessfleches/QueenRaid.java <<'JAVAQUEENRAID'
+          package fr.chessfleches;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          /** Optional queen-first training style. Only provides legal, non-hanging queen moves.
+           *  It cannot force the opponent to leave pawns undefended. */
+          public final class QueenRaid {
+            private QueenRaid() {}
+            private static Chess.Move byUci(List<Chess.Move> legal,String uci){
+              for(Chess.Move m:legal)if(Chess.uci(m).equals(uci))return m;
+              return null;
+            }
+            public static boolean safe(Chess.Board board,Chess.Move m){
+              if(m==null||Character.toLowerCase(board.b[m.from])!='q')return false;
+              Chess.Board after=Chess.move(board,m);
+              // A queen on an attacked square is not considered a free pawn pickup.
+              // An immediate forced checkmate is the exception.
+              return !Chess.squareAttacked(after,m.to,!board.whiteTurn)||
+                     (Chess.inCheck(after,after.whiteTurn)&&Chess.legal(after).isEmpty());
+            }
+            public static List<Chess.Move> queenMoves(Chess.Board board,List<Chess.Move> legal){
+              List<Chess.Move> safe=new ArrayList<>();
+              for(Chess.Move m:legal)if(safe(board,m))safe.add(m);
+              return safe;
+            }
+            public static List<Chess.Move> pawnCaptures(Chess.Board board,List<Chess.Move> legal){
+              List<Chess.Move> pawns=new ArrayList<>();
+              for(Chess.Move m:legal)if(Character.toLowerCase(board.b[m.to])=='p')pawns.add(m);
+              return pawns;
+            }
+            /** White: early Qh5 attack. Black: Scandinavian Qxd5 when white captures.
+             *  All moves are checked against actual board state and king safety. */
+            public static Chess.Move opening(Chess.Board board,List<Chess.Move> legal){
+              if(board==null||board.fullmove>4)return null;
+              if(board.whiteTurn){
+                if(board.fullmove==1&&board.b[59]=='Q'&&board.b[52]=='P'&&board.b[36]=='.'){
+                  Chess.Move e4=byUci(legal,"e2e4");
+                  if(e4!=null)return e4;
+                }
+                if(board.b[59]=='Q'&&board.b[36]=='P'){
+                  Chess.Move h5=byUci(legal,"d1h5");
+                  if(safe(board,h5))return h5;
+                }
+              }else if(board.b[3]=='q'){
+                if(board.b[27]=='P'){
+                  Chess.Move take=byUci(legal,"d8d5");
+                  if(safe(board,take))return take;
+                }
+                if(board.fullmove==1&&board.b[11]=='p'){
+                  Chess.Move d5=byUci(legal,"d7d5");
+                  if(d5!=null&&board.b[36]=='P')return d5;
+                  Chess.Move e5=byUci(legal,"e7e5");
+                  if(e5!=null)return e5;
+                }
+                Chess.Move h4=byUci(legal,"d8h4");
+                if(safe(board,h4))return h4;
+              }
+              return null;
+            }
+          }
+          JAVAQUEENRAID
+          python3 - <<'PYV14'
+          from pathlib import Path
+          root=Path('ChessFleches/app/src/main/java/fr/chessfleches')
+
+          def once(filename,old,new,note):
+              p=root/filename; s=p.read_text(encoding='utf-8'); count=s.count(old)
+              if count!=1:raise RuntimeError(f'V14 {note}: expected exactly one anchor, got {count}')
+              p.write_text(s.replace(old,new,1),encoding='utf-8')
+
+          once('StyleMode.java',
+              '  PIEGEUR_FOU("PIÉGEUR FOU 🔥 · Alien / mat / attaque", 0xFFFF8F30);',
+              '  PIEGEUR_FOU("PIÉGEUR FOU 🔥 · Alien / mat / attaque", 0xFFFF8F30),\n  REINE_CHASSEUSE("REINE CHASSEUSE 👑 · sortie rapide / pions", 0xFFFFD55B);',
+              'Queen Raid style enum')
+          once('MainActivity.java',
+              '    root.addView(label("Pour une partie reprise, l\'image ne permet pas de savoir si roi ou tour ont déjà bougé. Désactive cette case en cas de doute.",12));',
+              '''    root.addView(label("REINE CHASSEUSE : joue e4/Qh5 avec les Blancs, essaie le gambit scandinave Qxd5 avec les Noirs ; cherche les pions avec la reine. La reine est protégée : si un coup est mauvais, le moteur pourra jouer une autre pièce.",13));
+              root.addView(label("Pour une partie reprise, l'image ne permet pas de savoir si roi ou tour ont déjà bougé. Désactive cette case en cas de doute.",12));''',
+              'new queen mode description')
+          once('MainActivity.java',
+              '"Version V13 · mouvement roi/roque · piégeur fou"',
+              '"Version V14 · roi/roque · piégeur fou · reine chasseuse"',
+              'version caption')
+          once('CaptureService.java',
+              '    else overlay.status("À toi · "+Chess.uci(arrows.get(0).move)+" · "+activeEngine+(styles.contains(StyleMode.PIEGEUR_FOU)?" · PIÉGEUR FOU":""));',
+              '    else overlay.status("À toi · "+Chess.uci(arrows.get(0).move)+" · "+activeEngine+(styles.contains(StyleMode.REINE_CHASSEUSE)?" · REINE CHASSEUSE":styles.contains(StyleMode.PIEGEUR_FOU)?" · PIÉGEUR FOU":""));',
+              'queen style status')
+
+          once('StockfishEngine.java',
+              '  private static Chess.Move find(List<Chess.Move> legal,String uci){',
+              '''            private static final class RootResult {
+                String bestmove;Candidate bestScore;
+                RootResult(String uci,Candidate score){bestmove=uci;bestScore=score;}
+              }
+              /** One short, fully drained UCI search. Optional root restriction is applied
+               * only to safe legal queen moves, never to the opponent's replies. */
+              private RootResult rootSearch(Chess.Board board,List<Chess.Move> restriction,int millis) throws Exception {
+                command("position fen "+board.fen());
+                StringBuilder go=new StringBuilder("go movetime ").append(millis);
+                if(restriction!=null){
+                  if(restriction.isEmpty())return null;
+                  go.append(" searchmoves");
+                  for(Chess.Move m:restriction)go.append(' ').append(Chess.uci(m));
+                }
+                command(go.toString());
+                Map<Integer,Candidate> info=new HashMap<>();String best=null;
+                long deadline=System.nanoTime()+700_000_000L;
+                while(System.nanoTime()<deadline&&ready()){
+                  if(reader.ready()){
+                    String line=reader.readLine();if(line==null)break;
+                    if(line.startsWith("info "))parseInfo(line,info);
+                    else if(line.startsWith("bestmove ")){
+                      String[] tokens=line.trim().split("\\s+");
+                      if(tokens.length>1)best=tokens[1];
+                      break;
+                    }
+                  }else Thread.sleep(2);
+                }
+                if(best==null){
+                  command("stop");String late=readUntil("bestmove ",220);
+                  if(late!=null){String[] parts=late.trim().split("\\s+");if(parts.length>1)best=parts[1];}
+                }
+                return best==null?null:new RootResult(best,info.get(1));
+              }
+              /** One baseline search + one short queen-only search, around 0.2s total.
+               * If queen play is tactically inferior, use the ordinary best move. */
+              private List<TacticalEngine.Suggestion> queenAttack(Chess.Board board,List<Chess.Move> legal){
+                Chess.Move book=QueenRaid.opening(board,legal);
+                if(book!=null)return Collections.singletonList(new TacticalEngine.Suggestion(book,0,StyleMode.REINE_CHASSEUSE));
+                if(!ensureReady())return Collections.emptyList();
+                try{
+                  if(multiPV!=1){command("setoption name MultiPV value 1");multiPV=1;}
+                  RootResult standard=rootSearch(board,null,75);
+                  if(standard==null){lastError="Recherche dame indisponible";return Collections.emptyList();}
+                  Chess.Move selected=find(legal,standard.bestmove);
+                  if(selected==null){lastError="Coup moteur non légal";return Collections.emptyList();}
+                  List<Chess.Move> candidates=QueenRaid.queenMoves(board,legal);
+                  if(!candidates.isEmpty()){
+                    List<Chess.Move> pawnCaptures=QueenRaid.pawnCaptures(board,candidates);
+                    // Captures by the queen are the priority; otherwise search all safe queen moves.
+                    List<Chess.Move> target=pawnCaptures.isEmpty()?candidates:pawnCaptures;
+                    RootResult queen=rootSearch(board,target,95);
+                    if(queen!=null && queen.bestScore!=null && standard.bestScore!=null){
+                      Chess.Move move=find(target,queen.bestmove);
+                      int drop=standard.bestScore.score-queen.bestScore.score;
+                      int maximumDrop=!pawnCaptures.isEmpty()?145:board.fullmove<=6?135:85;
+                      if(move!=null && drop<=maximumDrop)selected=move;
+                    }
+                  }
+                  lastError="";
+                  return Collections.singletonList(new TacticalEngine.Suggestion(selected,0,StyleMode.REINE_CHASSEUSE));
+                }catch(Exception ex){lastError=ex.getClass().getSimpleName()+": "+ex.getMessage();close();return Collections.emptyList();}
+              }
+              private static Chess.Move find(List<Chess.Move> legal,String uci){''',
+              'queen-limited safe Stockfish search')
+          once('StockfishEngine.java',
+              '    boolean traps=styles!=null&&styles.contains(StyleMode.PIEGEUR_FOU);',
+              '''              // Queen mode has priority over other checked styles, including PIEGEUR_FOU.
+                if(styles!=null&&styles.contains(StyleMode.REINE_CHASSEUSE))return queenAttack(board,legal);
+                boolean traps=styles!=null&&styles.contains(StyleMode.PIEGEUR_FOU);''',
+              'queen mode route')
+
+          build=Path('ChessFleches/app/build.gradle'); b=build.read_text(encoding='utf-8')
+          assert b.count("versionCode 13; versionName '1.3-roi-fiable'")==1
+          b=b.replace("versionCode 13; versionName '1.3-roi-fiable'","versionCode 14; versionName '1.4-reine-chasseuse'",1)
+          assert b.count("applicationId 'fr.chessfleches.piegeurfou.v13'")==1
+          b=b.replace("applicationId 'fr.chessfleches.piegeurfou.v13'","applicationId 'fr.chessfleches.piegeurfou.v14'",1)
+          build.write_text(b,encoding='utf-8')
+          manifest=Path('ChessFleches/app/src/main/AndroidManifest.xml'); m=manifest.read_text(encoding='utf-8')
+          assert m.count('android:label="Chess Flèches V13"')==1
+          manifest.write_text(m.replace('android:label="Chess Flèches V13"','android:label="Chess Flèches V14"',1),encoding='utf-8')
+          print('V14 queen attack and pawn capture mode installed; earlier modes remain unchanged')
+          PYV14
+          cat > /tmp/TestQueenV14.java <<'JAVAQUEENTEST'
+          package fr.chessfleches;
+          import java.util.List;
+          public final class TestQueenV14 {
+            private static Chess.Board play(Chess.Board b,String uci){
+              for(Chess.Move m:Chess.legal(b))if(Chess.uci(m).equals(uci))return Chess.move(b,m);
+              throw new AssertionError("Illegal test move "+uci+" on "+b.fen());
+            }
+            private static void eq(String expected,Chess.Move move){
+              if(move==null||!expected.equals(Chess.uci(move)))throw new AssertionError(expected+" != "+move);
+            }
+            private static void yes(boolean ok,String note){if(!ok)throw new AssertionError(note);}
+            public static void main(String[] args){
+              Chess.Board w=Chess.initial();eq("e2e4",QueenRaid.opening(w,Chess.legal(w)));
+              w=play(w,"e2e4");w=play(w,"e7e5");eq("d1h5",QueenRaid.opening(w,Chess.legal(w)));
+              Chess.Board t=Chess.initial();t=play(t,"e2e4");eq("d7d5",QueenRaid.opening(t,Chess.legal(t)));
+              t=play(t,"d7d5");t=play(t,"e4d5");eq("d8d5",QueenRaid.opening(t,Chess.legal(t)));
+              Chess.Board g=Chess.initial();g=play(g,"e2e4");g=play(g,"g7g6");
+              Chess.Move unsafe=null;
+              for(Chess.Move m:Chess.legal(g))if(Chess.uci(m).equals("d1h5"))unsafe=m;
+              yes(unsafe!=null&&!QueenRaid.safe(g,unsafe),"Qh5 into g6 pawn must be rejected");
+              yes(QueenRaid.opening(g,Chess.legal(g))==null,"Do not force Qh5 into pawn attack");
+              for(Chess.Move m:QueenRaid.queenMoves(g,Chess.legal(g)))yes(QueenRaid.safe(g,m),"Unsafe queen move returned");
+              Chess.Board other=play(play(Chess.initial(),"d2d4"),"d7d5");
+              yes(QueenRaid.opening(other,Chess.legal(other))==null,"Do not force white e4 book in mid game");
+              System.out.println("OK: early white queen, Scandinavian black queen, defended squares, safe queen alternatives");
+            }
+          }
+          JAVAQUEENTEST
+          mkdir -p /tmp/chess-v14-test
+          javac -encoding UTF-8 -d /tmp/chess-v14-test \
+            ChessFleches/app/src/main/java/fr/chessfleches/{Chess,StyleMode,TacticalEngine,AlienGambit,StockfishEngine,QueenRaid,KingMoveEvidence}.java \
+            /tmp/TestQueenV14.java
+          java -cp /tmp/chess-v14-test fr.chessfleches.TestQueenV14
+
+      - name: Ajouter CHEVAUX FOUS V15 - ouvertures, fourchettes et mat
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > ChessFleches/app/src/main/java/fr/chessfleches/KnightRaid.java <<'JAVAKNIGHT'
+          package fr.chessfleches;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          /** Cavalier-first tactical style. Restricts OUR candidate moves, never opponent replies.
+           * Legal chess rules still apply: no knight can move when that would leave our king in check.
+           */
+          public final class KnightRaid {
+            private KnightRaid(){}
+            private static Chess.Move byUci(List<Chess.Move> moves,String uci){
+              for(Chess.Move m:moves)if(Chess.uci(m).equals(uci))return m;
+              return null;
+            }
+            public static boolean safe(Chess.Board board,Chess.Move m){
+              if(board==null||m==null||Character.toLowerCase(board.b[m.from])!='n')return false;
+              Chess.Board after=Chess.move(board,m);
+              if(!Chess.squareAttacked(after,m.to,!board.whiteTurn))return true;
+              // A queen/rook for one knight is sometimes a profitable exchange.
+              if(Chess.pieceValue(board.b[m.to])>=500)return true;
+              // A checkmate is worth more than any recapture.
+              return Chess.inCheck(after,after.whiteTurn)&&Chess.legal(after).isEmpty();
+            }
+            public static List<Chess.Move> knightMoves(Chess.Board board,List<Chess.Move> legal){
+              List<Chess.Move> out=new ArrayList<>();
+              for(Chess.Move m:legal)if(safe(board,m))out.add(m);
+              return out;
+            }
+            /** Counts enemy important pieces directly attacked by the knight after moving.
+             * Includes king so a king+queen or king+rook attack qualifies as a fork. */
+            public static int forkCount(Chess.Board board,Chess.Move m){
+              if(board==null||m==null||Character.toLowerCase(board.b[m.from])!='n')return 0;
+              Chess.Board after=Chess.move(board,m);
+              int r=Chess.row(m.to),c=Chess.col(m.to),targets=0;
+              int[][] jumps={{-2,-1},{-2,1},{-1,-2},{-1,2},{1,-2},{1,2},{2,-1},{2,1}};
+              for(int[] jump:jumps){
+                int rr=r+jump[0],cc=c+jump[1];
+                if(rr<0||rr>=8||cc<0||cc>=8)continue;
+                char target=after.b[rr*8+cc];
+                if(target=='.'||Character.isUpperCase(target)==board.whiteTurn)continue;
+                char kind=Character.toLowerCase(target);
+                if(kind=='k'||kind=='q'||kind=='r'||kind=='b'||kind=='n')targets++;
+              }
+              return targets;
+            }
+            public static List<Chess.Move> tacticalMoves(Chess.Board board,List<Chess.Move> candidates){
+              List<Chess.Move> out=new ArrayList<>();
+              for(Chess.Move m:candidates){
+                Chess.Board after=Chess.move(board,m);
+                if(board.b[m.to]!='.'||forkCount(board,m)>=2||Chess.inCheck(after,after.whiteTurn))out.add(m);
+              }
+              return out;
+            }
+            /** Move the original knights first if this is still the very beginning.
+             * Never force a move into an attacked square. No unnatural pawn moves. */
+            public static Chess.Move opening(Chess.Board board,List<Chess.Move> legal){
+              if(board==null||board.fullmove>4)return null;
+              String[] preference=board.whiteTurn?
+                new String[]{"g1f3","b1c3","g1h3","b1a3"}:
+                new String[]{"g8f6","b8c6","g8h6","b8a6"};
+              for(String uci:preference){
+                Chess.Move m=byUci(legal,uci);
+                if(safe(board,m))return m;
+              }
+              return null;
+            }
+          }
+          JAVAKNIGHT
+          python3 - <<'PYV15'
+          from pathlib import Path
+          root=Path('ChessFleches/app/src/main/java/fr/chessfleches')
+          def once(filename,old,new,note):
+              p=root/filename;s=p.read_text(encoding='utf-8');n=s.count(old)
+              if n!=1:raise RuntimeError(f'V15 {note}: expected 1 match, found {n}')
+              p.write_text(s.replace(old,new,1),encoding='utf-8')
+
+          once('StyleMode.java',
+              '  REINE_CHASSEUSE("REINE CHASSEUSE 👑 · sortie rapide / pions", 0xFFFFD55B);',
+              '  REINE_CHASSEUSE("REINE CHASSEUSE 👑 · sortie rapide / pions", 0xFFFFD55B),\n  CHEVAUX_FOUS("CHEVAUX FOUS ♞ · fourchettes / mat rapide", 0xFF6DD6F0);',
+              'add knight mode enum')
+          once('MainActivity.java',
+              '    root.addView(label("REINE CHASSEUSE : joue e4/Qh5 avec les Blancs, essaie le gambit scandinave Qxd5 avec les Noirs ; cherche les pions avec la reine. La reine est protégée : si un coup est mauvais, le moteur pourra jouer une autre pièce.",13));',
+              '''    root.addView(label("REINE CHASSEUSE : joue e4/Qh5 avec les Blancs, essaie le gambit scandinave Qxd5 avec les Noirs ; cherche les pions avec la reine. La reine est protégée : si un coup est mauvais, le moteur pourra jouer une autre pièce.",13));
+              root.addView(label("CHEVAUX FOUS : développe les 2 cavaliers en premier, cherche les fourchettes, les prises, les échecs et les mats. Repli vers le meilleur coup si un cavalier serait perdu.",13));''',
+              'knight mode description')
+          once('MainActivity.java',
+              '"Version V14 · roi/roque · piégeur fou · reine chasseuse"',
+              '"Version V15 · roi/roque · pièges · reine · chevaux fous"',
+              'version caption')
+          once('CaptureService.java',
+              'styles.contains(StyleMode.REINE_CHASSEUSE)?" · REINE CHASSEUSE":styles.contains(StyleMode.PIEGEUR_FOU)?" · PIÉGEUR FOU":""',
+              'styles.contains(StyleMode.CHEVAUX_FOUS)?" · CHEVAUX FOUS":styles.contains(StyleMode.REINE_CHASSEUSE)?" · REINE CHASSEUSE":styles.contains(StyleMode.PIEGEUR_FOU)?" · PIÉGEUR FOU":""',
+              'knight status')
+
+          # V14 already provides RootResult and rootSearch, so reuse them: no third-party engine.
+          once('StockfishEngine.java',
+               '  private List<TacticalEngine.Suggestion> queenAttack(Chess.Board board,List<Chess.Move> legal){',
+               '''  private List<TacticalEngine.Suggestion> knightAttack(Chess.Board board,List<Chess.Move> legal){
+                Chess.Move opening=KnightRaid.opening(board,legal);
+                if(opening!=null)return Collections.singletonList(new TacticalEngine.Suggestion(opening,0,StyleMode.CHEVAUX_FOUS));
+                if(!ensureReady())return Collections.emptyList();
+                try{
+                  if(multiPV!=1){command("setoption name MultiPV value 1");multiPV=1;}
+                  RootResult standard=rootSearch(board,null,75);
+                  if(standard==null){lastError="Recherche cavaliers indisponible";return Collections.emptyList();}
+                  Chess.Move chosen=find(legal,standard.bestmove);
+                  if(chosen==null){lastError="Coup moteur non légal";return Collections.emptyList();}
+                  // Already a sound knight move: keep the fastest Stockfish result.
+                  if(KnightRaid.safe(board,chosen)){
+                    lastError="";
+                    return Collections.singletonList(new TacticalEngine.Suggestion(chosen,0,StyleMode.CHEVAUX_FOUS));
+                  }
+                  List<Chess.Move> knights=KnightRaid.knightMoves(board,legal);
+                  if(!knights.isEmpty()){
+                    List<Chess.Move> tactical=KnightRaid.tacticalMoves(board,knights);
+                    // A knight fork/check/capture is tested first, but never forced when losing.
+                    if(!tactical.isEmpty()){
+                      RootResult forced=rootSearch(board,tactical,90);
+                      Chess.Move candidate=forced==null?null:find(tactical,forced.bestmove);
+                      if(acceptableKnight(board,standard,forced,candidate,true))chosen=candidate;
+                    }
+                    if(chosen==find(legal,standard.bestmove)){
+                      RootResult knight=rootSearch(board,knights,90);
+                      Chess.Move candidate=knight==null?null:find(knights,knight.bestmove);
+                      if(acceptableKnight(board,standard,knight,candidate,false))chosen=candidate;
+                    }
+                  }
+                  lastError="";
+                  return Collections.singletonList(new TacticalEngine.Suggestion(chosen,0,StyleMode.CHEVAUX_FOUS));
+                }catch(Exception ex){lastError=ex.getClass().getSimpleName()+": "+ex.getMessage();close();return Collections.emptyList();}
+              }
+              private static boolean acceptableKnight(Chess.Board b,RootResult normal,RootResult knight,
+                                                     Chess.Move move,boolean tactical){
+                if(move==null||normal==null||knight==null||normal.bestScore==null||knight.bestScore==null)return false;
+                int best=normal.bestScore.score,k=knight.bestScore.score;
+                // Never trade away a forced mating line in pursuit of a knight move.
+                if(best>20000&&k<best)return false;
+                // If the engine sees imminent mate against us, choose the strongest defence.
+                if(best < -20000 && k<best)return false;
+                int allowed=b.fullmove<=6?95:b.fullmove<=12?70:45;
+                if(tactical)allowed+=15;
+                return best-k<=allowed;
+              }
+              private List<TacticalEngine.Suggestion> queenAttack(Chess.Board board,List<Chess.Move> legal){''',
+              'knight-only search and evaluation comparison')
+          once('StockfishEngine.java',
+               '      if(styles!=null&&styles.contains(StyleMode.REINE_CHASSEUSE))return queenAttack(board,legal);',
+               '''                // Knight mode takes priority when multiple checkboxes are active.
+                          if(styles!=null&&styles.contains(StyleMode.CHEVAUX_FOUS))return knightAttack(board,legal);
+                          if(styles!=null&&styles.contains(StyleMode.REINE_CHASSEUSE))return queenAttack(board,legal);''',
+               'route knight mode')
+
+          build=Path('ChessFleches/app/build.gradle');b=build.read_text(encoding='utf-8')
+          assert b.count("versionCode 14; versionName '1.4-reine-chasseuse'")==1
+          assert b.count("applicationId 'fr.chessfleches.piegeurfou.v14'")==1
+          b=b.replace("versionCode 14; versionName '1.4-reine-chasseuse'","versionCode 15; versionName '1.5-chevaux-fous'",1)
+          b=b.replace("applicationId 'fr.chessfleches.piegeurfou.v14'","applicationId 'fr.chessfleches.piegeurfou.v15'",1)
+          build.write_text(b,encoding='utf-8')
+          manifest=Path('ChessFleches/app/src/main/AndroidManifest.xml');m=manifest.read_text(encoding='utf-8')
+          assert m.count('android:label="Chess Flèches V14"')==1
+          manifest.write_text(m.replace('android:label="Chess Flèches V14"','android:label="Chess Flèches V15"',1),encoding='utf-8')
+          print('V15: knight opening, fork/capture/check search, engine safety; other modes preserved')
+          PYV15
+          cat > /tmp/TestKnightV15.java <<'JAVAKNIGHTTEST'
+          package fr.chessfleches;
+          import java.util.List;
+          public final class TestKnightV15 {
+            private static Chess.Board play(Chess.Board b,String uci){
+              for(Chess.Move m:Chess.legal(b))if(Chess.uci(m).equals(uci))return Chess.move(b,m);
+              throw new AssertionError("Illegal test move "+uci+" on "+b.fen());
+            }
+            private static void eq(String expected,Chess.Move m){
+              if(m==null||!expected.equals(Chess.uci(m)))throw new AssertionError(expected+" != "+m);
+            }
+            private static void yes(boolean b,String note){if(!b)throw new AssertionError(note);}
+            public static void main(String[] args){
+              Chess.Board b=Chess.initial();
+              eq("g1f3",KnightRaid.opening(b,Chess.legal(b)));
+              b=play(b,"g1f3");
+              eq("g8f6",KnightRaid.opening(b,Chess.legal(b)));
+              b=play(b,"g8f6");
+              eq("b1c3",KnightRaid.opening(b,Chess.legal(b)));
+              b=play(b,"b1c3");
+              eq("b8c6",KnightRaid.opening(b,Chess.legal(b)));
+              b=play(b,"b8c6");
+              yes(KnightRaid.opening(b,Chess.legal(b))==null,"No knights remain on home squares");
+              List<Chess.Move> moves=KnightRaid.knightMoves(b,Chess.legal(b));
+              for(Chess.Move m:moves){
+                yes(Character.toLowerCase(b.b[m.from])=='n',"A non-knight got through");
+                yes(KnightRaid.safe(b,m),"Unsafe knight candidate");
+              }
+              System.out.println("OK: knight openings both colors, legal moves, and safety");
+            }
+          }
+          JAVAKNIGHTTEST
+          mkdir -p /tmp/chess-v15-test
+          javac -encoding UTF-8 -d /tmp/chess-v15-test \
+            ChessFleches/app/src/main/java/fr/chessfleches/{Chess,StyleMode,TacticalEngine,AlienGambit,StockfishEngine,QueenRaid,KnightRaid,KingMoveEvidence}.java \
+            /tmp/TestKnightV15.java
+          java -cp /tmp/chess-v15-test fr.chessfleches.TestKnightV15
+
+      - name: Compiler APK
+        working-directory: ChessFleches
+        run: gradle :app:assembleDebug --no-daemon
+
+      - name: Recuperer APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChessFleches-V15-Chevaux-Fous-APK
+          path: ChessFleches/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
